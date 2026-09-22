@@ -1,0 +1,6 @@
+pyTelegramBotAPI
+pandas
+ta
+BinaryOptionsToolsV2
+flask
+gunicorn
