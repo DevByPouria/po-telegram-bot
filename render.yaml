@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: po-telegram-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python po_telegram_bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: POCKET_OPTION_SSID
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.9
