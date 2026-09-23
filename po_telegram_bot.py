@@ -535,8 +535,11 @@ def status_route():
         "auto_start_done": auto_start_done,
     }), 200
 
+# ================== راه‌اندازی خودکار در سطح ماژول ==================
+# این خط مهمه: وقتی Gunicorn فایل رو import می‌کنه، این thread اجرا می‌شه
+_startup_thread = threading.Thread(target=auto_start, daemon=True)
+_startup_thread.start()
+
 if __name__ == "__main__":
-    # راه‌اندازی خودکار در پس‌زمینه
-    threading.Thread(target=auto_start, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
