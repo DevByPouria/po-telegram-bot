@@ -43,22 +43,55 @@ def calculate_rsi(df, period=14):
     return rsi_series.iloc[-1]
 
 async def get_candles(symbol, timeframe=60, count=100):
+    """دریافت کندل‌ها با متد history"""
     try:
-        candles = await api.get_candles(symbol, timeframe, count)
-        df = pd.DataFrame(candles, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-        return df
+        candles = await api.history(symbol, timeframe)
+        if candles and len(candles) > 0:
+            df = pd.DataFrame(candles)
+            # ستون‌های موردنیاز: time, open, high, low, close, volume
+            if 'close' not in df.columns:
+                # اگر ساختار متفاوت است، لاگ کن
+                print(f"ساختار کندل: {candles[0].keys() if isinstance(candles[0], dict) else type(candles[0])}")
+                return None
+            return df.tail(count)
+        return None
     except Exception as e:
         print(f"❌ خطا در دریافت کندل: {e}")
         return None
 
 async def execute_trade(direction):
+    """اجرای معامله با متد buy"""
     try:
+        # buy(asset, amount, time) → (trade_id, deal)
+        trade_id, deal = await api.buy(
+            asset=SYMBOL,
+            amount=TRADE_AMOUNT,
+            time=EXPIRY,
+            check_win=False
+        )
+        # direction فقط برای لاگ است (buy همیشه CALL است)
+        # برای PUT باید از sell استفاده کرد یا پارامتر direction را بررسی کرد
+        # طبق مستندات، buy برای CALL است
         if direction == "call":
-            result = await api.buy(SYMBOL, TRADE_AMOUNT, "call", EXPIRY)
-            await bot.send_message(chat_id, f"✅ معامله CALL انجام شد. نتیجه: {result}")
+            await bot.send_message(chat_id, f"✅ معامله CALL انجام شد.\nTrade ID: {trade_id}")
         elif direction == "put":
-            result = await api.buy(SYMBOL, TRADE_AMOUNT, "put", EXPIRY)
-            await bot.send_message(chat_id, f"✅ معامله PUT انجام شد. نتیجه: {result}")
+            # برای PUT باید از متد sell استفاده کنیم
+            sell_result = await api.sell(
+                asset=SYMBOL,
+                amount=TRADE_AMOUNT,
+                time=EXPIRY,
+                check_win=False
+            )
+            await bot.send_message(chat_id, f"✅ معامله PUT انجام شد.\nنتیجه: {sell_result}")
+        
+        # بررسی نتیجه بعد از انقضا
+        await asyncio.sleep(EXPIRY + 5)
+        try:
+            result = await api.check_win(trade_id)
+            await bot.send_message(chat_id, f"📊 نتیجه معامله: {result}")
+        except Exception as e:
+            await bot.send_message(chat_id, f"⚠️ خطا در بررسی نتیجه: {e}")
+            
     except Exception as e:
         await bot.send_message(chat_id, f"❌ خطا در اجرای معامله: {e}")
 
@@ -120,12 +153,13 @@ async def balance(message):
     chat_id = message.chat.id
     try:
         if api is None:
-            await bot.reply_to(message, "❌ API متصل نیست. لطفاً منتظر بمانید یا لاگ‌ها را بررسی کنید.")
+            await bot.reply_to(message, "❌ API متصل نیست.")
             return
-        bal = await asyncio.wait_for(api.balance(), timeout=10.0)
+        # استفاده از client.balance به جای api.balance
+        bal = await asyncio.wait_for(api.client.balance(), timeout=10.0)
         await bot.reply_to(message, f"💰 موجودی: {bal}$")
     except asyncio.TimeoutError:
-        await bot.reply_to(message, "⏳ دریافت موجودی طول کشید. لطفاً دوباره تلاش کنید.")
+        await bot.reply_to(message, "⏳ دریافت موجودی طول کشید.")
     except Exception as e:
         await bot.reply_to(message, f"❌ خطا: {e}")
 
@@ -136,16 +170,23 @@ async def main():
     try:
         api = PocketOptionAsync(POCKET_OPTION_SSID)
         await api.connect()
-        # تست اتصال با یک درخواست ساده
-        bal = await asyncio.wait_for(api.balance(), timeout=15.0)
-        print(f"✅ به Pocket Option متصل شد. موجودی: {bal}$")
-    except asyncio.TimeoutError:
-        print("❌ خطا: اتصال به Pocket Option timeout خورد.")
+        print("✅ به Pocket Option متصل شد.")
+        
+        # دریافت موجودی قبل از wait_for_assets
+        try:
+            bal = await asyncio.wait_for(api.client.balance(), timeout=10.0)
+            print(f"💰 موجودی: {bal}$")
+        except:
+            print("⚠️ موجودی در دسترس نیست (شاید نیاز به wait_for_assets باشد)")
+        
+        await api.wait_for_assets()
+        print("✅ Assets آماده شد.")
+        
     except Exception as e:
-        print(f"❌ خطا در اتصال به Pocket Option: {e}")
+        print(f"❌ خطا در اتصال: {e}")
+        return
     
     print("🚀 ربات تلگرام در حال اجراست...")
-    # پاک کردن وب‌هوک و پیام‌های قدیمی برای جلوگیری از تداخل
     await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.gather(bot.polling(), trading_loop())
 
