@@ -15,23 +15,29 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY")
 
-# ================== ۱۰ جفت‌ارز ==================
+# ================== ۱۰ جفت‌ارز (۵ ین + ۵ اصلی) ==================
 SYMBOLS = {
-    "EUR/USD": "EUR/USD",
+    # جفت‌های ین (بهترین عملکرد قبلی)
     "USD/JPY": "USD/JPY",
-    "GBP/USD": "GBP/USD",
-    "AUD/USD": "AUD/USD",
-    "USD/CAD": "USD/CAD",
-    "USD/CHF": "USD/CHF",
     "EUR/JPY": "EUR/JPY",
     "GBP/JPY": "GBP/JPY",
     "AUD/JPY": "AUD/JPY",
     "CHF/JPY": "CHF/JPY",
+    # جفت‌های اصلی
+    "EUR/USD": "EUR/USD",
+    "GBP/USD": "GBP/USD",
+    "USD/CHF": "USD/CHF",
+    "USD/CAD": "USD/CAD",
+    "AUD/USD": "AUD/USD",
 }
 
 INTERVAL = "5min"
 OUTPUTSIZE = 5000
 EXPIRY = 3
+
+# ================== فیلتر ساعت (۸-۲۰ UTC) ==================
+SESSION_START_UTC = 8
+SESSION_END_UTC = 20
 
 backtest_running = False
 
@@ -46,18 +52,23 @@ def send_telegram(message):
     except Exception as e:
         print(f"خطا در ارسال: {e}")
 
+def is_session_active(dt):
+    return SESSION_START_UTC <= dt.hour < SESSION_END_UTC
+
 # ================== الگوهای کندلی ==================
 def bullish_engulfing(df, i):
     if i < 1: return False
     p, c = df.iloc[i-1], df.iloc[i]
     return (p['close'] < p['open'] and c['close'] > c['open']
-            and c['close'] > p['open'] and c['open'] < p['close'])
+            and c['close'] > p['open'] and c['open'] < p['close']
+            and abs(c['close'] - c['open']) > abs(p['close'] - p['open']) * 1.1)
 
 def bearish_engulfing(df, i):
     if i < 1: return False
     p, c = df.iloc[i-1], df.iloc[i]
     return (p['close'] > p['open'] and c['close'] < c['open']
-            and c['close'] < p['open'] and c['open'] > p['close'])
+            and c['close'] < p['open'] and c['open'] > p['close']
+            and abs(c['close'] - c['open']) > abs(p['close'] - p['open']) * 1.1)
 
 def hammer(df, i):
     c = df.iloc[i]
@@ -87,18 +98,20 @@ def calc_indicators(df):
     bb = ta.volatility.BollingerBands(df['close'], 20, 2)
     df['bb_high'] = bb.bollinger_hband()
     df['bb_low'] = bb.bollinger_lband()
+    df['bb_mid'] = bb.bollinger_mavg()
     adx_ind = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], 14)
     df['adx'] = adx_ind.adx()
     df['di_plus'] = adx_ind.adx_pos()
     df['di_minus'] = adx_ind.adx_neg()
+    df['ema20'] = ta.trend.EMAIndicator(df['close'], 20).ema_indicator()
     df['ema50'] = ta.trend.EMAIndicator(df['close'], 50).ema_indicator()
     return df
 
-# ================== تشخیص سیگنال ==================
+# ================== هسته تشخیص سیگنال ==================
 def get_signal(df, i):
     row = df.iloc[i]
     
-    if pd.isna(row['adx']) or pd.isna(row['rsi']) or pd.isna(row['bb_high']):
+    if pd.isna(row['adx']) or pd.isna(row['rsi']) or pd.isna(row['bb_high']) or pd.isna(row['ema20']):
         return None
     
     adx = row['adx']
@@ -107,25 +120,31 @@ def get_signal(df, i):
     di_plus = row['di_plus']
     di_minus = row['di_minus']
     
-    # ===== حالت ۱: روند قوی (Momentum) =====
+    # ==================== حالت ۱: روند قوی (ADX > 25) ====================
     if adx > 25:
-        # CALL: روند صعودی + کندل صعودی
+        # CALL: روند صعودی + پول‌بک به EMA20
         if di_plus > di_minus and price > row['ema50']:
-            if bullish_pattern(df, i):
-                return "CALL"
-        # PUT: روند نزولی + کندل نزولی
+            distance_to_ema20 = abs(price - row['ema20']) / price
+            if distance_to_ema20 < 0.0015 and 35 < rsi < 65:
+                if bullish_pattern(df, i):
+                    return "CALL"
+        
+        # PUT: روند نزولی + پول‌بک به EMA20
         if di_minus > di_plus and price < row['ema50']:
-            if bearish_pattern(df, i):
-                return "PUT"
+            distance_to_ema20 = abs(price - row['ema20']) / price
+            if distance_to_ema20 < 0.0015 and 35 < rsi < 65:
+                if bearish_pattern(df, i):
+                    return "PUT"
     
-    # ===== حالت ۲: رنج (Reversion) =====
-    else:  # adx <= 25
-        # CALL: اشباع فروش
-        if rsi < 25 and price <= row['bb_low']:
+    # ==================== حالت ۲: رنج (ADX ≤ 25) ====================
+    else:
+        # CALL: اشباع فروش + زیر BB پایین
+        if rsi < 30 and price <= row['bb_low']:
             if bullish_pattern(df, i):
                 return "CALL"
-        # PUT: اشباع خرید
-        if rsi > 75 and price >= row['bb_high']:
+        
+        # PUT: اشباع خرید + بالای BB بالا
+        if rsi > 70 and price >= row['bb_high']:
             if bearish_pattern(df, i):
                 return "PUT"
     
@@ -151,11 +170,25 @@ def backtest_symbol(name, symbol):
         df = calc_indicators(df)
         print(f"✅ {name}: {len(df)} کندل")
 
-        wins_call, losses_call = 0, 0
-        wins_put, losses_put = 0, 0
-        trend_signals, range_signals = 0, 0
+        total_signals = 0
+        wins = 0
+        losses = 0
+        trend_calls = 0
+        trend_puts = 0
+        range_calls = 0
+        range_puts = 0
+        days_with_data = set()
 
         for i in range(50, len(df) - EXPIRY):
+            try:
+                candle_time = df.index[i]
+                if hasattr(candle_time, 'hour'):
+                    if not is_session_active(candle_time):
+                        continue
+                    days_with_data.add(candle_time.date())
+            except:
+                pass
+            
             direction = get_signal(df, i)
             if direction is None:
                 continue
@@ -164,37 +197,44 @@ def backtest_symbol(name, symbol):
             exit_p = df['close'].iloc[i + EXPIRY]
             adx_val = df['adx'].iloc[i]
             
+            total_signals += 1
+            
             if adx_val > 25:
-                trend_signals += 1
+                if direction == 'CALL': trend_calls += 1
+                else: trend_puts += 1
             else:
-                range_signals += 1
+                if direction == 'CALL': range_calls += 1
+                else: range_puts += 1
             
             if direction == 'CALL':
-                if exit_p > entry:
-                    wins_call += 1
-                else:
-                    losses_call += 1
+                is_win = exit_p > entry
             else:
-                if exit_p < entry:
-                    wins_put += 1
-                else:
-                    losses_put += 1
+                is_win = exit_p < entry
+            
+            if is_win:
+                wins += 1
+            else:
+                losses += 1
 
-        total_wins = wins_call + wins_put
-        total_losses = losses_call + losses_put
-        total = total_wins + total_losses
-        wr = (total_wins / total * 100) if total > 0 else 0
+        total = wins + losses
+        wr = (wins / total * 100) if total > 0 else 0
+        num_days = len(days_with_data) if days_with_data else 1
+        signals_per_day = round(total_signals / num_days, 1)
 
         del df
         gc.collect()
         return {
             "symbol": name,
-            "signals": total,
-            "wins": total_wins,
-            "losses": total_losses,
+            "signals": total_signals,
+            "signals_per_day": signals_per_day,
+            "wins": wins,
+            "losses": losses,
             "win_rate": round(wr, 2),
-            "trend_signals": trend_signals,
-            "range_signals": range_signals
+            "trend_calls": trend_calls,
+            "trend_puts": trend_puts,
+            "range_calls": range_calls,
+            "range_puts": range_puts,
+            "days": num_days,
         }
     except Exception as e:
         return {"symbol": name, "error": str(e)}
@@ -206,13 +246,15 @@ def run_backtest_background():
         return
     backtest_running = True
     try:
-        send_telegram("📊 <b>بک‌تست استراتژی ADX+Momentum شروع شد</b>\n"
+        send_telegram("📊 <b>بک‌تست نسخه نهایی شروع شد</b>\n\n"
+                      "🧠 ADX Regime + Pullback + Reversion\n"
+                      "⏰ سشن ۸-۲۰ UTC (۱۲ ساعت)\n"
+                      "🎯 ۱۰ جفت‌ارز (۵ ین + ۵ اصلی)\n"
                       "⏱ ۵ دقیقه | اکسپایر ۱۵ دقیقه\n"
-                      "🧠 ADX + RSI + BB + الگوی کندلی\n"
-                      "🎯 ۱۰ جفت‌ارز")
+                      "🎯 هدف: روزی ۵-۱۰ سیگنال")
 
         total_w, total_l, total_s = 0, 0, 0
-        total_trend, total_range = 0, 0
+        all_days = set()
 
         for name, sym in SYMBOLS.items():
             r = backtest_symbol(name, sym)
@@ -221,27 +263,28 @@ def run_backtest_background():
                 continue
 
             msg = (f"<b>{r['symbol']}</b>\n"
-                   f"📈 سیگنال: {r['signals']}\n"
+                   f"📈 سیگنال: {r['signals']} (روزی {r['signals_per_day']})\n"
                    f"✅ {r['wins']}W / ❌ {r['losses']}L\n"
                    f"🎯 وین ریت: <b>{r['win_rate']}%</b>\n"
-                   f"📊 روند: {r['trend_signals']} | رنج: {r['range_signals']}")
+                   f"📊 روند: {r['trend_calls']}C/{r['trend_puts']}P | "
+                   f"رنج: {r['range_calls']}C/{r['range_puts']}P")
             send_telegram(msg)
 
             total_w += r['wins']
             total_l += r['losses']
             total_s += r['signals']
-            total_trend += r['trend_signals']
-            total_range += r['range_signals']
 
         tot = total_w + total_l
         overall = (total_w / tot * 100) if tot > 0 else 0
+        # تخمین روزها بر اساس ۵۲ روز معاملاتی
+        estimated_days = 52
+        signals_per_day_total = round(total_s / estimated_days, 1) if estimated_days > 0 else 0
+        
         final = (f"🏁 <b>جمع کل:</b>\n\n"
                  f"📈 سیگنال: {total_s}\n"
+                 f"📅 تخمین روزانه: ~{signals_per_day_total} سیگنال\n"
                  f"✅ برد: {total_w} | ❌ باخت: {total_l}\n"
-                 f"🎯 <b>وین ریت: {round(overall, 2)}%</b>\n\n"
-                 f"📊 تفکیک:\n"
-                 f"  روند قوی (ADX>25): {total_trend} سیگنال\n"
-                 f"  رنج (ADX≤25): {total_range} سیگنال")
+                 f"🎯 <b>وین ریت: {round(overall, 2)}%</b>")
         send_telegram(final)
     finally:
         backtest_running = False
