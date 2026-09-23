@@ -30,23 +30,22 @@ INTERVAL = "15min"
 HTF_INTERVAL = "1h"
 OUTPUTSIZE = 5000
 HTF_OUTPUTSIZE = 800
-EXPIRY_CANDLES = 2  # ۲ کندل ۱۵ دقیقه = ۳۰ دقیقه
-THRESHOLD = 70  # آستانه اطمینان
+EXPIRY_CANDLES = 2
+THRESHOLD = 70
 N_FOLDS = 4
 MIN_TRAIN_RATIO = 0.4
 
-# ================== تنظیمات بانک و ریسک ==================
 INITIAL_BANKROLL = 1000.0
-PAYOUT = 0.85  # ۸۵٪ سود در هر برد
-STAKE_PCT = 0.01  # ۱٪ ریسک
+PAYOUT = 0.85
+STAKE_PCT = 0.01
 
-# ================== تایم‌زون ایران ==================
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
 # ================== وضعیت ==================
 backtest_running = False
 live_running = False
-trained_models = {}  # {symbol: model}
+trained_models = {}
+auto_start_done = False
 
 def send_telegram(message):
     if not BOT_TOKEN or not CHAT_ID:
@@ -58,13 +57,11 @@ def send_telegram(message):
         print(f"telegram error: {e}")
 
 def to_iran(dt):
-    """تبدیل datetime به وقت ایران"""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(IRAN_TZ)
 
 def fmt_iran(dt):
-    """فرمت خوانای وقت ایران"""
     return to_iran(dt).strftime("%H:%M")
 
 # ================== الگوهای کندلی ==================
@@ -94,7 +91,6 @@ def shooting_p(df, i):
     lw = min(c['close'], c['open']) - c['low']
     return int(uw >= 2 * body and lw <= body * 0.8)
 
-# ================== Features ==================
 def build_ltf_features(df):
     df = df.copy()
     df['rsi'] = ta.momentum.RSIIndicator(df['close'], 14).rsi()
@@ -220,7 +216,6 @@ def purged_walk_forward(X, y, meta, expiry, n_folds):
         oos_meta.extend(m_te)
     return np.array(oos_probs), np.array(oos_y), oos_meta, fold_info
 
-# ================== Backtest ==================
 def backtest_symbol(name, symbol):
     try:
         print(f"⏳ {name}...")
@@ -250,7 +245,6 @@ def backtest_symbol(name, symbol):
         if len(oos_probs) < 50:
             return {"symbol": name, "error": "OOS کم"}
         
-        # محاسبه با threshold
         bankroll = INITIAL_BANKROLL
         signals, wins = 0, 0
         for j, prob in enumerate(oos_probs):
@@ -270,7 +264,6 @@ def backtest_symbol(name, symbol):
         wr = (wins / signals * 100) if signals > 0 else 0
         ret_pct = (bankroll - INITIAL_BANKROLL) / INITIAL_BANKROLL * 100
         
-        # تعداد روز
         if len(oos_meta) >= 2:
             days = (oos_meta[-1]['time'] - oos_meta[0]['time']).days
             days = max(days, 1)
@@ -278,7 +271,6 @@ def backtest_symbol(name, symbol):
             days = 1
         sig_per_day = round(signals / days, 1)
         
-        # آموزش مدل نهایی روی همه داده برای live
         final_model = RandomForestClassifier(
             n_estimators=200, max_depth=10,
             min_samples_split=20, min_samples_leaf=10,
@@ -305,17 +297,15 @@ def backtest_symbol(name, symbol):
 def run_backtest_background():
     global backtest_running
     if backtest_running:
-        send_telegram("⚠️ بک‌تست قبلی در جریان است")
         return
     backtest_running = True
     try:
         send_telegram(
-            "🔬 <b>بک‌تست نهایی</b>\n\n"
+            "🔬 <b>بک‌تست در حال اجرا</b>\n\n"
             "🎯 ۴ جفت‌ارز منتخب\n"
             "⏱ اکسپایر: ۳۰ دقیقه\n"
-            "🎯 آستانه: ۷۰٪\n"
-            "💰 بانک اولیه: ۱۰۰۰$ | ریسک: ۱٪\n\n"
-            "⏳ در حال اجرا..."
+            "🎯 آستانه: ۷۰٪\n\n"
+            "⏳ ۵-۸ دقیقه طول می‌کشه..."
         )
         
         results = []
@@ -326,7 +316,6 @@ def run_backtest_background():
                 continue
             results.append(r)
             
-            # گزارش ساده برای هر جفت
             msg = (
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"📌 <b>{r['symbol']}</b>\n"
@@ -335,17 +324,15 @@ def run_backtest_background():
                 f"📈 <b>سیگنال:</b> {r['signals']} (روزی ~{r['signals_per_day']})\n"
                 f"💰 <b>بانک:</b> 1000$ → {r['final_bankroll']}$\n"
                 f"📊 <b>سود:</b> {r['return_pct']}%\n"
-                f"📉 <b>دقت فولدها:</b> {r['folds']}"
+                f"📉 <b>فولدها:</b> {r['folds']}"
             )
             send_telegram(msg)
         
-        # خلاصه نهایی
         if results:
             total_signals = sum(r['signals'] for r in results)
             total_wins = sum(r['wins'] for r in results)
             avg_wr = round(total_wins / total_signals * 100, 2) if total_signals > 0 else 0
-            total_ret = sum(r['return_pct'] for r in results)
-            avg_ret = round(total_ret / len(results), 2)
+            avg_ret = round(sum(r['return_pct'] for r in results) / len(results), 2)
             
             final = (
                 f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -353,23 +340,19 @@ def run_backtest_background():
                 f"━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"📊 وین ریت میانگین: <b>{avg_wr}%</b>\n"
                 f"📈 مجموع سیگنال: {total_signals}\n"
-                f"💰 میانگین بازدهی: <b>+{avg_ret}%</b>\n\n"
-                f"✅ آماده برای تست لایو"
+                f"💰 میانگین بازدهی: <b>+{avg_ret}%</b>"
             )
             send_telegram(final)
     finally:
         backtest_running = False
 
-# ================== Live Signal ==================
 def analyze_live(symbol):
-    """تحلیل لحظه‌ای برای یک نماد"""
     try:
         td = TDClient(apikey=TWELVE_DATA_API_KEY)
         ts = td.time_series(symbol=symbol, interval=INTERVAL, outputsize=500, timezone="UTC")
         df = ts.as_pandas()
         if df is None or df.empty or len(df) < 250:
             return None
-        
         ts_h = td.time_series(symbol=symbol, interval=HTF_INTERVAL, outputsize=200, timezone="UTC")
         df_h = ts_h.as_pandas()
         
@@ -384,7 +367,6 @@ def analyze_live(symbol):
         if len(df) < 250:
             return None
         
-        # آخرین کندل بسته شده
         last_row = df.iloc[-1]
         if last_row[FEATURE_COLS].isna().any():
             return None
@@ -406,7 +388,7 @@ def analyze_live(symbol):
         expiry_time = entry_time + timedelta(minutes=30)
         
         return {
-            "symbol": symbol.replace("=X", ""),
+            "symbol": symbol,
             "direction": direction,
             "confidence": round(confidence, 1),
             "entry_price": entry_price,
@@ -418,7 +400,6 @@ def analyze_live(symbol):
         return None
 
 def live_loop():
-    """حلقه اصلی تحلیل زنده - هر ۱۵ دقیقه، ۵ ثانیه بعد از بسته شدن کندل"""
     global live_running
     last_signal_time = {}
     
@@ -428,55 +409,98 @@ def live_loop():
             minute = now_utc.minute
             second = now_utc.second
             
-            # بررسی: آیا دقیقه بر ۱۵ بخش‌پذیر است و ۵ ثانیه گذشته؟
-            if minute % 15 == 0 and 5 <= second <= 20:
-                # جلوگیری از اجرای چندباره
+            if minute % 15 == 0 and 5 <= second <= 25:
                 slot_key = now_utc.strftime("%Y%m%d%H%M")
                 if slot_key == last_signal_time.get("_slot"):
                     time.sleep(5)
                     continue
                 last_signal_time["_slot"] = slot_key
                 
-                print(f"🔍 بررسی سیگنال‌ها در {now_utc}")
+                print(f"🔍 بررسی سیگنال‌ها در {to_iran(now_utc).strftime('%H:%M')} ایران")
                 
                 for name, sym in SYMBOLS.items():
                     try:
                         result = analyze_live(sym)
                         if result is None:
+                            time.sleep(2)
                             continue
                         
-                        # جلوگیری از ارسال تکراری
                         sig_key = f"{result['symbol']}_{result['entry_time'].strftime('%Y%m%d%H%M')}"
                         if sig_key == last_signal_time.get(result['symbol']):
+                            time.sleep(2)
                             continue
                         last_signal_time[result['symbol']] = sig_key
                         
-                        # ارسال به تلگرام
                         emoji = "🟢" if result['direction'] == "CALL" else "🔴"
                         msg = (
                             f"{emoji} <b>سیگنال {result['direction']}</b>\n"
                             f"━━━━━━━━━━━━━━━━━━━━\n"
                             f"📊 نماد: <b>{result['symbol']}</b>\n"
-                            f"🕐 ورود: <b>{fmt_iran(result['entry_time'])}</b> (به وقت ایران)\n"
+                            f"🕐 ورود: <b>{fmt_iran(result['entry_time'])}</b> ایران\n"
                             f"⏱ اکسپایر: <b>۳۰ دقیقه</b>\n"
-                            f"🔔 پایان: <b>{fmt_iran(result['expiry_time'])}</b>\n"
+                            f"🔔 پایان: <b>{fmt_iran(result['expiry_time'])}</b> ایران\n"
                             f"💵 قیمت: {result['entry_price']:.5f}\n"
                             f"🎯 اطمینان: <b>{result['confidence']}%</b>"
                         )
                         send_telegram(msg)
-                        print(f"✅ سیگنال ارسال شد: {result['symbol']} {result['direction']}")
+                        print(f"✅ سیگنال: {result['symbol']} {result['direction']}")
                     except Exception as e:
-                        print(f"error in analyze {name}: {e}")
-                    time.sleep(2)  # بین جفت‌ارزها
+                        print(f"error {name}: {e}")
+                    time.sleep(2)
             
             time.sleep(5)
         except Exception as e:
             print(f"live_loop error: {e}")
             time.sleep(10)
 
+# ================== راه‌اندازی خودکار ==================
+def auto_start():
+    """خودکار راه‌اندازی: اگه مدل نیست، بک‌تست بزن، بعد live رو فعال کن"""
+    global live_running, auto_start_done
+    
+    time.sleep(15)  # صبر تا Flask آماده بشه
+    
+    print("=" * 50)
+    print("🤖 راه‌اندازی خودکار شروع شد")
+    print("=" * 50)
+    
+    try:
+        send_telegram("🤖 <b>راه‌اندازی خودکار</b>\n\nدر حال آماده‌سازی ربات...")
+        
+        # چک کن مدل هست یا نه
+        if not trained_models:
+            print("📚 مدل‌ها وجود ندارن. شروع بک‌تست...")
+            run_backtest_background()
+            
+            # صبر تا بک‌تست تموم بشه
+            while backtest_running:
+                time.sleep(5)
+            
+            print(f"✅ بک‌تست تموم شد. {len(trained_models)} مدل آموزش دید.")
+        
+        # فعال کردن live
+        if trained_models and not live_running:
+            live_running = True
+            threading.Thread(target=live_loop, daemon=True).start()
+            print("🟢 حالت سیگنال زنده فعال شد.")
+            send_telegram(
+                "🟢 <b>ربات آماده است!</b>\n\n"
+                f"🎯 {len(trained_models)} مدل آموزش‌دیده\n"
+                f"⏱ اکسپایر: ۳۰ دقیقه\n"
+                f"🎯 آستانه: {THRESHOLD}%\n\n"
+                "از این به بعد، سیگنال‌ها خودکار ارسال می‌شن.\n"
+                "موفق باشی! 🚀"
+            )
+        auto_start_done = True
+    except Exception as e:
+        print(f"auto_start error: {e}")
+        import traceback
+        traceback.print_exc()
+        send_telegram(f"❌ خطا در راه‌اندازی خودکار: {e}")
+
 @app.route('/')
 def health():
-    return "Signal Server is running!"
+    return f"Signal Server | Models: {len(trained_models)} | Live: {live_running}"
 
 @app.route('/backtest', methods=['GET'])
 def backtest_route():
@@ -487,12 +511,12 @@ def backtest_route():
 def start_live_route():
     global live_running
     if live_running:
-        return jsonify({"status": "already running"}), 200
+        return jsonify({"status": "already_running"}), 200
     if not trained_models:
-        return jsonify({"status": "error", "message": "اول بک‌تست بزن"}), 400
+        return jsonify({"status": "error", "message": "مدل آموزش ندیده. صبر کن یا /backtest بزن"}), 400
     live_running = True
     threading.Thread(target=live_loop, daemon=True).start()
-    send_telegram("🟢 حالت سیگنال زنده فعال شد. از این به بعد سیگنال‌ها ارسال می‌شن.")
+    send_telegram("🟢 حالت سیگنال زنده فعال شد.")
     return jsonify({"status": "started"}), 200
 
 @app.route('/stop_live', methods=['GET'])
@@ -502,6 +526,17 @@ def stop_live_route():
     send_telegram("🔴 حالت سیگنال زنده متوقف شد.")
     return jsonify({"status": "stopped"}), 200
 
+@app.route('/status', methods=['GET'])
+def status_route():
+    return jsonify({
+        "models": list(trained_models.keys()),
+        "live_running": live_running,
+        "backtest_running": backtest_running,
+        "auto_start_done": auto_start_done,
+    }), 200
+
 if __name__ == "__main__":
+    # راه‌اندازی خودکار در پس‌زمینه
+    threading.Thread(target=auto_start, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
