@@ -3,6 +3,5 @@ requests
 gunicorn
 pandas
 numpy
-yfinance
 ta
 twelvedata
