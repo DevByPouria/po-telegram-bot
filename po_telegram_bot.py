@@ -1,195 +1,72 @@
-import asyncio
 import os
-import threading
-import pandas as pd
-import ta
-from flask import Flask
-from telebot.async_telebot import AsyncTeleBot
-from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
+import json
+import requests
+from flask import Flask, request, jsonify
 
-# ================== تنظیمات ==================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-POCKET_OPTION_SSID = os.environ.get("POCKET_OPTION_SSID", "")
-SYMBOL = "EURUSD_otc"
-EXPIRY = 60
-TRADE_AMOUNT = 1
-RSI_PERIOD = 14
-RSI_OVERBOUGHT = 70
-RSI_OVERSOLD = 30
-CHECK_INTERVAL = 10
-
-# ================== Flask (برای Render) ==================
 app = Flask(__name__)
+
+# ================== تنظیمات از Environment Variables ==================
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
+
+def send_telegram(message):
+    """ارسال پیام به تلگرام"""
+    if not BOT_TOKEN or not CHAT_ID:
+        print("❌ خطا: BOT_TOKEN یا CHAT_ID تنظیم نشده")
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        print(f"✅ تلگرام: {response.status_code}")
+    except Exception as e:
+        print(f"❌ خطا در ارسال: {e}")
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """دریافت سیگنال از TradingView"""
+    try:
+        raw_data = request.get_data(as_text=True)
+        print(f"📩 دریافت شد: {raw_data}")
+        
+        try:
+            signal = json.loads(raw_data)
+        except:
+            signal = {"raw": raw_data}
+        
+        action = signal.get("action", "UNKNOWN")
+        symbol = signal.get("symbol", "N/A")
+        price = signal.get("price", "N/A")
+        time_str = signal.get("time", "N/A")
+        
+        if action == "BUY":
+            emoji = "🟢"
+            action_fa = "خرید (CALL)"
+        elif action == "SELL":
+            emoji = "🔴"
+            action_fa = "فروش (PUT)"
+        else:
+            emoji = "⚪"
+            action_fa = action
+        
+        message = f"""{emoji} <b>سیگنال جدید</b>
+
+📊 نماد: <code>{symbol}</code>
+💰 قیمت: <code>{price}</code>
+🕐 زمان: {time_str}
+📌 نوع: <b>{action_fa}</b>"""
+        
+        send_telegram(message)
+        return jsonify({"status": "ok"}), 200
+        
+    except Exception as e:
+        print(f"❌ خطا: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/')
 def health():
-    return "Bot is running!"
-
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
-
-# ================== متغیرهای جهانی ==================
-auto_trade = False
-chat_id = None
-api = None
-bot = AsyncTeleBot(BOT_TOKEN)
-
-# ================== توابع ==================
-def calculate_rsi(df, period=14):
-    if len(df) < period + 1:
-        return None
-    rsi_series = ta.momentum.RSIIndicator(df['close'], window=period).rsi()
-    return rsi_series.iloc[-1]
-
-async def get_candles(symbol, timeframe=60, count=100):
-    """دریافت کندل‌ها با متد history"""
-    try:
-        candles = await api.history(symbol, timeframe)
-        if candles and len(candles) > 0:
-            df = pd.DataFrame(candles)
-            # ستون‌های موردنیاز: time, open, high, low, close, volume
-            if 'close' not in df.columns:
-                # اگر ساختار متفاوت است، لاگ کن
-                print(f"ساختار کندل: {candles[0].keys() if isinstance(candles[0], dict) else type(candles[0])}")
-                return None
-            return df.tail(count)
-        return None
-    except Exception as e:
-        print(f"❌ خطا در دریافت کندل: {e}")
-        return None
-
-async def execute_trade(direction):
-    """اجرای معامله با متد buy"""
-    try:
-        # buy(asset, amount, time) → (trade_id, deal)
-        trade_id, deal = await api.buy(
-            asset=SYMBOL,
-            amount=TRADE_AMOUNT,
-            time=EXPIRY,
-            check_win=False
-        )
-        # direction فقط برای لاگ است (buy همیشه CALL است)
-        # برای PUT باید از sell استفاده کرد یا پارامتر direction را بررسی کرد
-        # طبق مستندات، buy برای CALL است
-        if direction == "call":
-            await bot.send_message(chat_id, f"✅ معامله CALL انجام شد.\nTrade ID: {trade_id}")
-        elif direction == "put":
-            # برای PUT باید از متد sell استفاده کنیم
-            sell_result = await api.sell(
-                asset=SYMBOL,
-                amount=TRADE_AMOUNT,
-                time=EXPIRY,
-                check_win=False
-            )
-            await bot.send_message(chat_id, f"✅ معامله PUT انجام شد.\nنتیجه: {sell_result}")
-        
-        # بررسی نتیجه بعد از انقضا
-        await asyncio.sleep(EXPIRY + 5)
-        try:
-            result = await api.check_win(trade_id)
-            await bot.send_message(chat_id, f"📊 نتیجه معامله: {result}")
-        except Exception as e:
-            await bot.send_message(chat_id, f"⚠️ خطا در بررسی نتیجه: {e}")
-            
-    except Exception as e:
-        await bot.send_message(chat_id, f"❌ خطا در اجرای معامله: {e}")
-
-async def trading_loop():
-    global auto_trade, api
-    while True:
-        if not auto_trade or chat_id is None:
-            await asyncio.sleep(2)
-            continue
-        try:
-            df = await get_candles(SYMBOL, 60, 100)
-            if df is None or len(df) < RSI_PERIOD + 1:
-                await asyncio.sleep(CHECK_INTERVAL)
-                continue
-            rsi = calculate_rsi(df, RSI_PERIOD)
-            if rsi is None:
-                await asyncio.sleep(CHECK_INTERVAL)
-                continue
-            last_close = df['close'].iloc[-1]
-            await bot.send_message(chat_id, f"📊 تحلیل: RSI = {rsi:.2f} | قیمت = {last_close}")
-            if rsi < RSI_OVERSOLD:
-                await bot.send_message(chat_id, "🔔 سیگنال خرید (CALL)!")
-                await execute_trade("call")
-            elif rsi > RSI_OVERBOUGHT:
-                await bot.send_message(chat_id, "🔔 سیگنال فروش (PUT)!")
-                await execute_trade("put")
-            else:
-                await bot.send_message(chat_id, "⏳ شرایط ورود فراهم نیست...")
-        except Exception as e:
-            try:
-                await bot.send_message(chat_id, f"⚠️ خطا: {e}")
-            except:
-                pass
-        await asyncio.sleep(CHECK_INTERVAL)
-
-# ================== دستورات تلگرام ==================
-@bot.message_handler(commands=['start'])
-async def start(message):
-    global chat_id
-    chat_id = message.chat.id
-    await bot.reply_to(message, "سلام! ربات آماده است.\n/auto_on روشن\n/auto_off خاموش\n/balance موجودی")
-
-@bot.message_handler(commands=['auto_on'])
-async def auto_on(message):
-    global auto_trade, chat_id
-    chat_id = message.chat.id
-    auto_trade = True
-    await bot.reply_to(message, "✅ معامله خودکار روشن شد.")
-
-@bot.message_handler(commands=['auto_off'])
-async def auto_off(message):
-    global auto_trade
-    auto_trade = False
-    await bot.reply_to(message, "⛔ خاموش شد.")
-
-@bot.message_handler(commands=['balance'])
-async def balance(message):
-    global chat_id
-    chat_id = message.chat.id
-    try:
-        if api is None:
-            await bot.reply_to(message, "❌ API متصل نیست.")
-            return
-        # استفاده از client.balance به جای api.balance
-        bal = await asyncio.wait_for(api.client.balance(), timeout=10.0)
-        await bot.reply_to(message, f"💰 موجودی: {bal}$")
-    except asyncio.TimeoutError:
-        await bot.reply_to(message, "⏳ دریافت موجودی طول کشید.")
-    except Exception as e:
-        await bot.reply_to(message, f"❌ خطا: {e}")
-
-# ================== اجرا ==================
-async def main():
-    global api
-    print("⏳ در حال اتصال به Pocket Option...")
-    try:
-        api = PocketOptionAsync(POCKET_OPTION_SSID)
-        await api.connect()
-        print("✅ به Pocket Option متصل شد.")
-        
-        # دریافت موجودی قبل از wait_for_assets
-        try:
-            bal = await asyncio.wait_for(api.client.balance(), timeout=10.0)
-            print(f"💰 موجودی: {bal}$")
-        except:
-            print("⚠️ موجودی در دسترس نیست (شاید نیاز به wait_for_assets باشد)")
-        
-        await api.wait_for_assets()
-        print("✅ Assets آماده شد.")
-        
-    except Exception as e:
-        print(f"❌ خطا در اتصال: {e}")
-        return
-    
-    print("🚀 ربات تلگرام در حال اجراست...")
-    await bot.delete_webhook(drop_pending_updates=True)
-    await asyncio.gather(bot.polling(), trading_loop())
+    return "Signal Server is running!"
 
 if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
-    asyncio.run(main())
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
