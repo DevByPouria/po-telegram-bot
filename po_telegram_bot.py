@@ -1,5 +1,7 @@
 import os
 import json
+import gc
+import threading
 import requests
 from flask import Flask, request, jsonify
 import pandas as pd
@@ -21,6 +23,8 @@ SYMBOLS = {
     "EURJPY": "EURJPY=X",
     "XAUUSD": "GC=F",
 }
+
+backtest_running = False
 
 def send_telegram(message):
     if not BOT_TOKEN or not CHAT_ID:
@@ -47,20 +51,19 @@ def bearish_engulfing(df, i):
 def hammer(df, i):
     c = df.iloc[i]
     body = abs(c['close'] - c['open'])
+    if body == 0: return False
     low_wick = min(c['close'], c['open']) - c['low']
     high_wick = c['high'] - max(c['close'], c['open'])
-    if body == 0: return False
     return low_wick > 2 * body and high_wick < body
 
 def shooting_star(df, i):
     c = df.iloc[i]
     body = abs(c['close'] - c['open'])
+    if body == 0: return False
     low_wick = min(c['close'], c['open']) - c['low']
     high_wick = c['high'] - max(c['close'], c['open'])
-    if body == 0: return False
     return high_wick > 2 * body and low_wick < body
 
-# ================== حمایت و مقاومت ==================
 def near_support(df, i, lookback=30):
     if i < lookback: return False
     recent_low = df['low'].iloc[i-lookback:i].min()
@@ -73,38 +76,31 @@ def near_resistance(df, i, lookback=30):
     price = df['close'].iloc[i]
     return abs(price - recent_high) / price < 0.001
 
-# ================== محاسبه اندیکاتورها ==================
 def calc_indicators(df):
     df['ema200'] = ta.trend.EMAIndicator(df['close'], 200).ema_indicator()
     df['rsi'] = ta.momentum.RSIIndicator(df['close'], 14).rsi()
     df['stoch'] = ta.momentum.StochasticOscillator(df['high'], df['low'], df['close'], 14, 3).stoch()
     return df
 
-# ================== امتیازدهی ==================
 def score_signal(df, i):
     row = df.iloc[i]
     sc_call, sc_put = 0, 0
     
-    # 1. روند - ۲۵ امتیاز
     if not pd.isna(row['ema200']):
         if row['close'] > row['ema200']: sc_call += 25
         elif row['close'] < row['ema200']: sc_put += 25
     
-    # 2. RSI - ۲۰ امتیاز
     if not pd.isna(row['rsi']):
         if row['rsi'] < 30: sc_call += 20
         elif row['rsi'] > 70: sc_put += 20
     
-    # 3. الگوی کندلی - ۲۵ امتیاز
     if bullish_engulfing(df, i) or hammer(df, i): sc_call += 25
     if bearish_engulfing(df, i) or shooting_star(df, i): sc_put += 25
     
-    # 4. استوکاستیک - ۱۵ امتیاز
     if not pd.isna(row['stoch']):
         if row['stoch'] < 20: sc_call += 15
         elif row['stoch'] > 80: sc_put += 15
     
-    # 5. حمایت/مقاومت - ۱۵ امتیاز
     if near_support(df, i): sc_call += 15
     if near_resistance(df, i): sc_put += 15
     
@@ -114,10 +110,10 @@ def score_signal(df, i):
         return sc_put, 'PUT'
     return max(sc_call, sc_put), None
 
-# ================== بک‌تست ==================
-def backtest_symbol(name, yf_sym, period="7d", interval="1m", expiry=5, threshold=75):
+def backtest_symbol(name, yf_sym, period="2d", interval="1m", expiry=5, threshold=75):
     try:
-        df = yf.download(yf_sym, period=period, interval=interval, progress=False)
+        print(f"⏳ دانلود {name}...")
+        df = yf.download(yf_sym, period=period, interval=interval, progress=False, auto_adjust=True)
         if df.empty or len(df) < 250:
             return {"symbol": name, "error": "داده کافی نیست"}
         
@@ -125,6 +121,7 @@ def backtest_symbol(name, yf_sym, period="7d", interval="1m", expiry=5, threshol
             df.columns = df.columns.get_level_values(0)
         df = df.rename(columns=str.lower)
         df = calc_indicators(df)
+        print(f"✅ {name}: {len(df)} کندل دریافت شد")
         
         wins, losses, signals = 0, 0, 0
         for i in range(200, len(df) - expiry):
@@ -143,28 +140,47 @@ def backtest_symbol(name, yf_sym, period="7d", interval="1m", expiry=5, threshol
         
         total = wins + losses
         wr = (wins / total * 100) if total > 0 else 0
-        return {"symbol": name, "signals": signals, "wins": wins, "losses": losses, "win_rate": round(wr, 2)}
+        result = {"symbol": name, "signals": signals, "wins": wins, "losses": losses, "win_rate": round(wr, 2)}
+        del df
+        gc.collect()
+        return result
     except Exception as e:
         return {"symbol": name, "error": str(e)}
 
-def run_backtest():
-    msg = "📊 <b>بک‌تست استراتژی امتیازدهی</b>\n\n"
-    msg += f"⏱ تایم‌فریم: ۱ دقیقه | اکسپایر: ۵ دقیقه | آستانه: ۷۵\n\n"
-    
-    total_w, total_l, total_s = 0, 0, 0
-    for name, sym in SYMBOLS.items():
-        r = backtest_symbol(name, sym)
-        if "error" in r:
-            msg += f"❌ {r['symbol']}: {r['error']}\n"
-            continue
-        msg += f"<b>{r['symbol']}</b>: {r['signals']} سیگنال | {r['wins']}W/{r['losses']}L | <b>{r['win_rate']}%</b>\n"
-        total_w += r['wins']; total_l += r['losses']; total_s += r['signals']
-    
-    tot = total_w + total_l
-    overall = (total_w / tot * 100) if tot > 0 else 0
-    msg += f"\n🎯 <b>جمع کل:</b> {total_s} سیگنال | {total_w}W/{total_l}L | <b>{round(overall, 2)}%</b>"
-    send_telegram(msg)
-    print(msg)
+def run_backtest_background():
+    global backtest_running
+    if backtest_running:
+        send_telegram("⚠️ بک‌تست قبلی هنوز در حال اجراست. لطفاً صبر کنید.")
+        return
+    backtest_running = True
+    try:
+        send_telegram("📊 <b>بک‌تست شروع شد</b>\n⏱ تایم‌فریم: ۱ دقیقه | اکسپایر: ۵ دقیقه | آستانه: ۷۵\n⏳ هر جفت‌ارز پس از اتمام گزارش می‌شود...")
+        
+        total_w, total_l, total_s = 0, 0, 0
+        for name, sym in SYMBOLS.items():
+            r = backtest_symbol(name, sym)
+            if "error" in r:
+                send_telegram(f"❌ <b>{r['symbol']}</b>: {r['error']}")
+                continue
+            send_telegram(
+                f"<b>{r['symbol']}</b>\n"
+                f"📈 سیگنال: {r['signals']}\n"
+                f"✅ برد: {r['wins']} | ❌ باخت: {r['losses']}\n"
+                f"🎯 وین ریت: <b>{r['win_rate']}%</b>"
+            )
+            total_w += r['wins']; total_l += r['losses']; total_s += r['signals']
+        
+        tot = total_w + total_l
+        overall = (total_w / tot * 100) if tot > 0 else 0
+        send_telegram(
+            f"🏁 <b>بک‌تست تمام شد</b>\n\n"
+            f"🎯 جمع کل:\n"
+            f"📈 سیگنال: {total_s}\n"
+            f"✅ برد: {total_w} | ❌ باخت: {total_l}\n"
+            f"🎯 وین ریت کلی: <b>{round(overall, 2)}%</b>"
+        )
+    finally:
+        backtest_running = False
 
 # ================== روت‌ها ==================
 @app.route('/')
@@ -188,11 +204,8 @@ def webhook():
 
 @app.route('/backtest', methods=['GET'])
 def backtest_route():
-    try:
-        run_backtest()
-        return jsonify({"status": "ok", "message": "نتایج به تلگرام ارسال شد"}), 200
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+    threading.Thread(target=run_backtest_background, daemon=True).start()
+    return jsonify({"status": "ok", "message": "بک‌تست در پس‌زمینه شروع شد. نتایج به تلگرام ارسال می‌شود."}), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
