@@ -3,6 +3,7 @@ import gc
 import time
 import threading
 import requests
+from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify
 import pandas as pd
 import numpy as np
@@ -19,29 +20,33 @@ TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY")
 
 # ================== تنظیمات ==================
 SYMBOLS = {
-    "USD/JPY": "USD/JPY",
-    "EUR/JPY": "EUR/JPY",
-    "GBP/JPY": "GBP/JPY",
     "EUR/USD": "EUR/USD",
+    "USD/JPY": "USD/JPY",
     "GBP/USD": "GBP/USD",
-    "USD/CHF": "USD/CHF",
+    "EUR/JPY": "EUR/JPY",
 }
 
 INTERVAL = "15min"
 HTF_INTERVAL = "1h"
 OUTPUTSIZE = 5000
 HTF_OUTPUTSIZE = 800
-EXPIRY_OPTIONS = [2, 3, 4]
+EXPIRY_CANDLES = 2  # ۲ کندل ۱۵ دقیقه = ۳۰ دقیقه
+THRESHOLD = 70  # آستانه اطمینان
 N_FOLDS = 4
 MIN_TRAIN_RATIO = 0.4
 
-THRESHOLDS_TO_REPORT = [60, 65, 70, 75, 80]
-PAYOUTS_TO_TEST = [0.75, 0.80, 0.85, 0.90]
-
+# ================== تنظیمات بانک و ریسک ==================
 INITIAL_BANKROLL = 1000.0
-STAKE_PCT = 0.01  # 1% ریسک در هر معامله
+PAYOUT = 0.85  # ۸۵٪ سود در هر برد
+STAKE_PCT = 0.01  # ۱٪ ریسک
 
+# ================== تایم‌زون ایران ==================
+IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
+
+# ================== وضعیت ==================
 backtest_running = False
+live_running = False
+trained_models = {}  # {symbol: model}
 
 def send_telegram(message):
     if not BOT_TOKEN or not CHAT_ID:
@@ -51,6 +56,16 @@ def send_telegram(message):
         requests.post(url, json={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=15)
     except Exception as e:
         print(f"telegram error: {e}")
+
+def to_iran(dt):
+    """تبدیل datetime به وقت ایران"""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(IRAN_TZ)
+
+def fmt_iran(dt):
+    """فرمت خوانای وقت ایران"""
+    return to_iran(dt).strftime("%H:%M")
 
 # ================== الگوهای کندلی ==================
 def bull_engulf(df, i):
@@ -79,7 +94,7 @@ def shooting_p(df, i):
     lw = min(c['close'], c['open']) - c['low']
     return int(uw >= 2 * body and lw <= body * 0.8)
 
-# ================== Features روی 15m ==================
+# ================== Features ==================
 def build_ltf_features(df):
     df = df.copy()
     df['rsi'] = ta.momentum.RSIIndicator(df['close'], 14).rsi()
@@ -109,12 +124,10 @@ def build_ltf_features(df):
     df['dist_ema20'] = (df['close'] - df['ema20']) / df['ema20']
     df['dist_ema50'] = (df['close'] - df['ema50']) / df['ema50']
     df['dist_ema200'] = (df['close'] - df['ema200']) / df['ema200']
-    # Cyclical
     df['hour_sin'] = np.sin(2 * np.pi * df.index.hour / 24)
     df['hour_cos'] = np.cos(2 * np.pi * df.index.hour / 24)
     df['dow_sin'] = np.sin(2 * np.pi * df.index.dayofweek / 7)
     df['dow_cos'] = np.cos(2 * np.pi * df.index.dayofweek / 7)
-    # Patterns
     df['bull_engulf'] = 0
     df['bear_engulf'] = 0
     df['hammer'] = 0
@@ -126,15 +139,7 @@ def build_ltf_features(df):
         df.iloc[i, df.columns.get_loc('shooting')] = shooting_p(df, i)
     return df
 
-# ================== Features روی 1H با timestamp اصلاح‌شده ==================
 def build_htf_features(df_htf):
-    """
-    برای هر کندل 1H، ویژگی‌ها را محاسبه می‌کند.
-    IMPORTANT: timestamp کندل 1H را به «زمان بسته شدن» تغییر می‌دهیم.
-    اگر timestamp در TwelveData = شروع کندل باشد،
-    بسته شدن = شروع + 1h.
-    سپس در merge_asof فقط از کندل‌های بسته‌شده استفاده می‌کنیم.
-    """
     df = df_htf.copy()
     df['htf_ema50'] = ta.trend.EMAIndicator(df['close'], 50).ema_indicator()
     df['htf_trend'] = (df['close'] > df['htf_ema50']).astype(int)
@@ -142,40 +147,19 @@ def build_htf_features(df_htf):
     adx = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], 14)
     df['htf_adx'] = adx.adx()
     df['htf_ema_dist'] = (df['close'] - df['htf_ema50']) / df['htf_ema50']
-    
-    # 🔴 حیاتی: timestamp را به «زمان بسته شدن» تغییر بده
-    # فرض: timestamp TwelveData = شروع کندل 1H
     df['close_time'] = df.index + pd.Timedelta(hours=1)
-    
     cols = ['htf_trend', 'htf_rsi', 'htf_adx', 'htf_ema_dist', 'close_time']
-    out = df[cols].copy()
-    out = out.set_index('close_time')
-    return out
+    return df[cols].set_index('close_time')
 
-# ================== ادغام HTF با LTF ==================
 def merge_htf_ltf(df_ltf, df_htf_features):
-    """
-    برای هر کندل 15m، آخرین کندل 1H که «بسته شده» را attach می‌کند.
-    merge_asof با direction='backward' فقط از کندل‌های با close_time <= current_time استفاده می‌کند.
-    """
-    left = df_ltf.reset_index().rename(columns={'index': 'time'})
-    # اگر index نام دارد (datetime)، این خط را امن می‌کند
+    left = df_ltf.reset_index()
     if 'time' not in left.columns:
         left['time'] = df_ltf.index
-    
     right = df_htf_features.reset_index().rename(columns={'close_time': 'time'})
-    
     left = left.sort_values('time')
     right = right.sort_values('time')
-    
-    merged = pd.merge_asof(
-        left, right,
-        on='time',
-        direction='backward',  # فقط کندل‌های بسته‌شده قبلی
-        allow_exact_matches=True
-    )
-    merged = merged.set_index('time')
-    return merged
+    merged = pd.merge_asof(left, right, on='time', direction='backward', allow_exact_matches=True)
+    return merged.set_index('time')
 
 FEATURE_COLS = [
     'rsi', 'bb_pos', 'macd', 'macd_signal', 'macd_diff',
@@ -188,7 +172,6 @@ FEATURE_COLS = [
     'htf_trend', 'htf_rsi', 'htf_adx', 'htf_ema_dist',
 ]
 
-# ================== Dataset با حذف Tie ==================
 def create_dataset(df, expiry):
     X, y, meta = [], [], []
     for i in range(250, len(df) - expiry):
@@ -197,329 +180,127 @@ def create_dataset(df, expiry):
             continue
         entry = row['close']
         exit_p = df['close'].iloc[i + expiry]
-        
-        # 🔴 Tie handling: حذف اگر exit == entry
         if exit_p == entry:
             continue
         label = 1 if exit_p > entry else 0
-        
         X.append(row[FEATURE_COLS].values.astype(float))
         y.append(label)
-        meta.append({
-            'time': df.index[i],
-            'entry': entry,
-            'exit': exit_p,
-            'htf_trend': int(row['htf_trend']) if not pd.isna(row['htf_trend']) else 0,
-        })
+        meta.append({'time': df.index[i], 'entry': entry})
     return np.array(X), np.array(y), meta
 
-# ================== Baselines ==================
-def compute_baselines(df, expiry):
-    """سه baseline ساده برای مقایسه"""
-    n = len(df) - expiry
-    
-    # 1. Always CALL
-    always_call_correct = 0
-    total = 0
-    for i in range(250, n):
-        entry = df['close'].iloc[i]
-        exit_p = df['close'].iloc[i + expiry]
-        if exit_p == entry:
-            continue
-        total += 1
-        if exit_p > entry:
-            always_call_correct += 1
-    
-    # 2. Previous candle direction
-    prev_correct = 0
-    prev_total = 0
-    for i in range(251, n):
-        prev_close = df['close'].iloc[i-1]
-        prev_open = df['open'].iloc[i-1]
-        entry = df['close'].iloc[i]
-        exit_p = df['close'].iloc[i + expiry]
-        if exit_p == entry:
-            continue
-        prev_total += 1
-        pred_up = prev_close > prev_open
-        actual_up = exit_p > entry
-        if pred_up == actual_up:
-            prev_correct += 1
-    
-    # 3. EMA200 trend
-    ema_correct = 0
-    ema_total = 0
-    for i in range(250, n):
-        row = df.iloc[i]
-        if pd.isna(row['ema200']):
-            continue
-        entry = row['close']
-        exit_p = df['close'].iloc[i + expiry]
-        if exit_p == entry:
-            continue
-        ema_total += 1
-        pred_up = entry > row['ema200']
-        actual_up = exit_p > entry
-        if pred_up == actual_up:
-            ema_correct += 1
-    
-    return {
-        'always_call': round(always_call_correct / total * 100, 2) if total > 0 else 0,
-        'prev_candle': round(prev_correct / prev_total * 100, 2) if prev_total > 0 else 0,
-        'ema200_trend': round(ema_correct / ema_total * 100, 2) if ema_total > 0 else 0,
-    }
-
-# ================== محاسبه متریک‌ها ==================
-def calc_metrics(probs, y_test, meta_test, threshold, payout, one_at_a_time=False, expiry=3):
-    """
-    محاسبه متریک‌ها با:
-    - بانک‌رول واقعی
-    - حالت one_at_a_time (فقط یک معامله باز در لحظه)
-    """
-    bankroll = INITIAL_BANKROLL
-    equity_curve = [bankroll]
-    
-    signals = 0
-    wins = 0
-    call_sig = call_wins = 0
-    put_sig = put_wins = 0
-    up_sig = up_wins = 0
-    dn_sig = dn_wins = 0
-    conf_buckets = {b: [0, 0] for b in range(50, 100, 5)}
-    conf_sum = 0.0
-    max_streak = 0
-    cur_streak = 0
-    last_trade_end_time = None
-    
-    for j, prob in enumerate(probs):
-        mp = max(prob)
-        if mp * 100 < threshold:
-            continue
-        
-        pred = 1 if prob[1] > prob[0] else 0
-        conf = mp * 100
-        is_win = int(pred == y_test[j])
-        
-        # one-at-a-time: اگر معامله قبلی هنوز بسته نشده، رد کن
-        if one_at_a_time:
-            current_time = meta_test[j]['time']
-            if last_trade_end_time is not None:
-                if current_time < last_trade_end_time:
-                    continue
-        
-        signals += 1
-        wins += is_win
-        conf_sum += conf
-        
-        # Bankroll update
-        stake = bankroll * STAKE_PCT
-        if is_win:
-            bankroll += stake * payout
-        else:
-            bankroll -= stake
-        equity_curve.append(bankroll)
-        
-        if one_at_a_time:
-            last_trade_end_time = meta_test[j]['time'] + pd.Timedelta(minutes=15 * expiry)
-        
-        if pred == 1:
-            call_sig += 1; call_wins += is_win
-        else:
-            put_sig += 1; put_wins += is_win
-        
-        htf = meta_test[j].get('htf_trend', -1)
-        if htf == 1:
-            up_sig += 1; up_wins += is_win
-        elif htf == 0:
-            dn_sig += 1; dn_wins += is_win
-        
-        b = int(conf // 5) * 5
-        if b in conf_buckets:
-            conf_buckets[b][0] += 1
-            conf_buckets[b][1] += is_win
-        
-        if not is_win:
-            cur_streak += 1
-            max_streak = max(max_streak, cur_streak)
-        else:
-            cur_streak = 0
-    
-    # Max Drawdown روی equity واقعی
-    peak = equity_curve[0]
-    max_dd = 0.0
-    for e in equity_curve:
-        if e > peak: peak = e
-        if peak > 0:
-            dd = (peak - e) / peak
-            max_dd = max(max_dd, dd)
-    
-    wr = (wins / signals * 100) if signals > 0 else 0
-    avg_conf = (conf_sum / signals) if signals > 0 else 0
-    # Expectancy per trade on unit stake
-    exp_val = (wr/100 * payout) - ((100-wr)/100)
-    
-    return {
-        'signals': signals, 'wins': wins, 'wr': round(wr, 2),
-        'call_sig': call_sig,
-        'call_wr': round(call_wins / call_sig * 100, 2) if call_sig > 0 else 0,
-        'put_sig': put_sig,
-        'put_wr': round(put_wins / put_sig * 100, 2) if put_sig > 0 else 0,
-        'up_sig': up_sig,
-        'up_wr': round(up_wins / up_sig * 100, 2) if up_sig > 0 else 0,
-        'dn_sig': dn_sig,
-        'dn_wr': round(dn_wins / dn_sig * 100, 2) if dn_sig > 0 else 0,
-        'max_streak': max_streak,
-        'max_dd': round(max_dd * 100, 2),
-        'final_bankroll': round(bankroll, 2),
-        'return_pct': round((bankroll - INITIAL_BANKROLL) / INITIAL_BANKROLL * 100, 2),
-        'expectancy': round(exp_val, 4),
-        'avg_conf': round(avg_conf, 2),
-        'conf_buckets': {k: v for k, v in conf_buckets.items() if v[0] > 0},
-    }
-
-# ================== Purged Walk-Forward ==================
 def purged_walk_forward(X, y, meta, expiry, n_folds):
     n = len(X)
     embargo = expiry
     remaining = n - int(n * MIN_TRAIN_RATIO)
     fold_size = remaining // n_folds
-    
     oos_probs, oos_y, oos_meta = [], [], []
     fold_info = []
-    feature_importances = []
-    
     for fold in range(n_folds):
         train_end = int(n * MIN_TRAIN_RATIO) + fold * fold_size
         test_start = train_end + embargo
         test_end = min(test_start + fold_size, n)
-        
         if test_end <= test_start or train_end < 200:
             continue
-        
         X_tr, y_tr = X[:train_end], y[:train_end]
         X_te, y_te = X[test_start:test_end], y[test_start:test_end]
         m_te = meta[test_start:test_end]
-        
         if len(X_te) < 20:
             continue
-        
         model = RandomForestClassifier(
-            n_estimators=100, max_depth=10,
+            n_estimators=200, max_depth=10,
             min_samples_split=20, min_samples_leaf=10,
             random_state=42, n_jobs=-1
         )
         model.fit(X_tr, y_tr)
         probs = model.predict_proba(X_te)
         acc = accuracy_score(y_te, model.predict(X_te))
-        
-        fold_info.append({
-            'fold': fold + 1,
-            'train_size': len(X_tr),
-            'test_size': len(X_te),
-            'accuracy': round(acc * 100, 2),
-        })
-        feature_importances.append(model.feature_importances_)
-        
+        fold_info.append(round(acc * 100, 2))
         oos_probs.extend(probs)
         oos_y.extend(y_te)
         oos_meta.extend(m_te)
-    
-    avg_importance = None
-    if feature_importances:
-        avg_importance = np.mean(feature_importances, axis=0)
-    
-    return np.array(oos_probs), np.array(oos_y), oos_meta, fold_info, avg_importance
+    return np.array(oos_probs), np.array(oos_y), oos_meta, fold_info
 
 # ================== Backtest ==================
 def backtest_symbol(name, symbol):
     try:
         print(f"⏳ {name}...")
         td = TDClient(apikey=TWELVE_DATA_API_KEY)
-        
         ts = td.time_series(symbol=symbol, interval=INTERVAL, outputsize=OUTPUTSIZE, timezone="UTC")
         df = ts.as_pandas()
         time.sleep(7)
-        
         ts_h = td.time_series(symbol=symbol, interval=HTF_INTERVAL, outputsize=HTF_OUTPUTSIZE, timezone="UTC")
         df_h = ts_h.as_pandas()
         time.sleep(7)
-        
         if df is None or df.empty or len(df) < 500:
-            return {"symbol": name, "error": "داده 15m کم"}
-        
+            return {"symbol": name, "error": "داده کم"}
         df = df.rename(columns=str.lower).sort_index()
         df_h = df_h.rename(columns=str.lower).sort_index()
-        
-        # HTF features با timestamp بسته شدن
         htf_feat = build_htf_features(df_h)
-        
-        # LTF features
         df = build_ltf_features(df)
-        
-        # ادغام با merge_asof
         df = merge_htf_ltf(df, htf_feat)
         df = df.dropna()
-        
         if len(df) < 500:
-            return {"symbol": name, "error": "داده پس از پاک‌سازی کم"}
+            return {"symbol": name, "error": "داده کم بعد فیلتر"}
         
-        # Baselines
-        baselines = compute_baselines(df, expiry=3)
+        X, y, meta = create_dataset(df, EXPIRY_CANDLES)
+        if len(X) < 400:
+            return {"symbol": name, "error": "نمونه کم"}
         
-        results_by_expiry = {}
-        for expiry in EXPIRY_OPTIONS:
-            X, y, meta = create_dataset(df, expiry)
-            if len(X) < 400:
+        oos_probs, oos_y, oos_meta, fold_info = purged_walk_forward(X, y, meta, EXPIRY_CANDLES, N_FOLDS)
+        if len(oos_probs) < 50:
+            return {"symbol": name, "error": "OOS کم"}
+        
+        # محاسبه با threshold
+        bankroll = INITIAL_BANKROLL
+        signals, wins = 0, 0
+        for j, prob in enumerate(oos_probs):
+            mp = max(prob)
+            if mp * 100 < THRESHOLD:
                 continue
-            
-            oos_probs, oos_y, oos_meta, fold_info, importance = purged_walk_forward(X, y, meta, expiry, N_FOLDS)
-            if len(oos_probs) < 50:
-                continue
-            
-            exp_results = {}
-            for th in THRESHOLDS_TO_REPORT:
-                # حالت all signals
-                all_sigs = calc_metrics(oos_probs, oos_y, oos_meta, th, 0.85, one_at_a_time=False, expiry=expiry)
-                # حالت one-at-a-time
-                one_sig = calc_metrics(oos_probs, oos_y, oos_meta, th, 0.85, one_at_a_time=True, expiry=expiry)
-                
-                # payout variations (فقط برای حالت all)
-                payout_results = {}
-                for p in PAYOUTS_TO_TEST:
-                    m = calc_metrics(oos_probs, oos_y, oos_meta, th, p, one_at_a_time=False, expiry=expiry)
-                    payout_results[p] = {
-                        'final_bankroll': m['final_bankroll'],
-                        'return_pct': m['return_pct'],
-                        'expectancy': m['expectancy'],
-                    }
-                
-                exp_results[th] = {
-                    'all': all_sigs,
-                    'one': one_sig,
-                    'payouts': payout_results,
-                }
-            
-            # Top features
-            top_feats = []
-            if importance is not None:
-                feat_imp = list(zip(FEATURE_COLS, importance))
-                feat_imp.sort(key=lambda x: -x[1])
-                top_feats = [(f, round(float(v)*100, 2)) for f, v in feat_imp[:10]]
-            
-            results_by_expiry[expiry] = {
-                'fold_info': fold_info,
-                'n_oos': len(oos_probs),
-                'results': exp_results,
-                'top_features': top_feats,
-            }
+            pred = 1 if prob[1] > prob[0] else 0
+            is_win = int(pred == oos_y[j])
+            signals += 1
+            wins += is_win
+            stake = bankroll * STAKE_PCT
+            if is_win:
+                bankroll += stake * PAYOUT
+            else:
+                bankroll -= stake
         
-        del df, df_h
-        gc.collect()
-        return {"symbol": name, "results_by_expiry": results_by_expiry, "baselines": baselines}
+        wr = (wins / signals * 100) if signals > 0 else 0
+        ret_pct = (bankroll - INITIAL_BANKROLL) / INITIAL_BANKROLL * 100
+        
+        # تعداد روز
+        if len(oos_meta) >= 2:
+            days = (oos_meta[-1]['time'] - oos_meta[0]['time']).days
+            days = max(days, 1)
+        else:
+            days = 1
+        sig_per_day = round(signals / days, 1)
+        
+        # آموزش مدل نهایی روی همه داده برای live
+        final_model = RandomForestClassifier(
+            n_estimators=200, max_depth=10,
+            min_samples_split=20, min_samples_leaf=10,
+            random_state=42, n_jobs=-1
+        )
+        final_model.fit(X, y)
+        trained_models[name] = final_model
+        
+        return {
+            "symbol": name,
+            "signals": signals,
+            "wins": wins,
+            "wr": round(wr, 2),
+            "signals_per_day": sig_per_day,
+            "return_pct": round(ret_pct, 2),
+            "final_bankroll": round(bankroll, 2),
+            "folds": fold_info,
+        }
     except Exception as e:
         import traceback
         print(traceback.format_exc())
-        return {"symbol": name, "error": f"{type(e).__name__}: {str(e)}"}
+        return {"symbol": name, "error": str(e)}
 
 def run_backtest_background():
     global backtest_running
@@ -529,114 +310,197 @@ def run_backtest_background():
     backtest_running = True
     try:
         send_telegram(
-            "🔬 <b>بک‌تست نسخه ۴ (اصلاح کامل)</b>\n\n"
-            "✅ Tie handling\n"
-            "✅ HTF merge_asof بدون leakage\n"
-            "✅ Bankroll واقعی (1000$, 1% ریسک)\n"
-            "✅ Baselines: always CALL / prev candle / EMA200\n"
-            "✅ Feature Importance\n"
-            "✅ Payout 75/80/85/90\n"
-            "✅ One-at-a-time simulation\n"
-            "✅ Fold-by-fold metrics\n"
-            "⏳ ۸-۱۲ دقیقه"
+            "🔬 <b>بک‌تست نهایی</b>\n\n"
+            "🎯 ۴ جفت‌ارز منتخب\n"
+            "⏱ اکسپایر: ۳۰ دقیقه\n"
+            "🎯 آستانه: ۷۰٪\n"
+            "💰 بانک اولیه: ۱۰۰۰$ | ریسک: ۱٪\n\n"
+            "⏳ در حال اجرا..."
         )
         
-        # جمع‌بندی
-        summary = {exp: {th: {'signals': 0, 'wins': 0, 'ret': 0} for th in THRESHOLDS_TO_REPORT} for exp in EXPIRY_OPTIONS}
-        
+        results = []
         for name, sym in SYMBOLS.items():
             r = backtest_symbol(name, sym)
             if "error" in r:
                 send_telegram(f"❌ <b>{name}</b>: {r['error']}")
                 continue
+            results.append(r)
             
-            # Baselines
-            b = r['baselines']
-            send_telegram(
-                f"<b>{name}</b> — Baselines\n"
-                f"  Always CALL: {b['always_call']}%\n"
-                f"  Prev candle: {b['prev_candle']}%\n"
-                f"  EMA200 trend: {b['ema200_trend']}%"
+            # گزارش ساده برای هر جفت
+            msg = (
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📌 <b>{r['symbol']}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"🎯 <b>وین ریت:</b> {r['wr']}%\n"
+                f"📈 <b>سیگنال:</b> {r['signals']} (روزی ~{r['signals_per_day']})\n"
+                f"💰 <b>بانک:</b> 1000$ → {r['final_bankroll']}$\n"
+                f"📊 <b>سود:</b> {r['return_pct']}%\n"
+                f"📉 <b>دقت فولدها:</b> {r['folds']}"
             )
-            
-            for expiry, ed in r['results_by_expiry'].items():
-                label = {2: "30د", 3: "45د", 4: "60د"}.get(expiry, f"{expiry*15}د")
-                
-                # Fold-by-fold
-                fold_str = " | ".join([f"F{f['fold']}:{f['accuracy']}%" for f in ed['fold_info']])
-                send_telegram(f"<b>{name}</b> — {label}\n📊 فولدها: {fold_str}")
-                
-                # Top features
-                if ed['top_features']:
-                    tf = "\n".join([f"  {f}: {v}%" for f, v in ed['top_features'][:5]])
-                    send_telegram(f"🔝 Top 5 features:\n{tf}")
-                
-                # Threshold 70 (canonical)
-                for th in [65, 70, 75]:
-                    if th not in ed['results']:
-                        continue
-                    m_all = ed['results'][th]['all']
-                    m_one = ed['results'][th]['one']
-                    if m_all['signals'] < 15:
-                        continue
-                    
-                    msg = (
-                        f"🎯 <b>ث {th}%</b>\n"
-                        f"  All sigs: {m_all['signals']} | WR <b>{m_all['wr']}%</b> | "
-                        f"Ret {m_all['return_pct']}% | DD {m_all['max_dd']}%\n"
-                        f"  One-at-a-time: {m_one['signals']} | WR {m_one['wr']}% | "
-                        f"Ret {m_one['return_pct']}% | DD {m_one['max_dd']}%\n"
-                        f"  📈 CALL {m_all['call_sig']} ({m_all['call_wr']}%) | "
-                        f"📉 PUT {m_all['put_sig']} ({m_all['put_wr']}%)\n"
-                        f"  ⬆️ UP {m_all['up_sig']} ({m_all['up_wr']}%) | "
-                        f"⬇️ DN {m_all['dn_sig']} ({m_all['dn_wr']}%)\n"
-                        f"  🔻 استریک: {m_all['max_streak']} | "
-                        f"💰 Exp: {m_all['expectancy']}"
-                    )
-                    send_telegram(msg)
-                    
-                    # Payout variations
-                    pv = ed['results'][th]['payouts']
-                    pv_str = "💵 <b>Payout variations:</b>\n"
-                    for p, v in pv.items():
-                        pv_str += f"  {int(p*100)}%: bankroll ${v['final_bankroll']} ({v['return_pct']}%)\n"
-                    send_telegram(pv_str)
-                    
-                    # Reliability برای th=70
-                    if th == 70:
-                        cal = "📊 <b>Reliability:</b>\n"
-                        for bk, (tt, w) in sorted(m_all['conf_buckets'].items()):
-                            if tt > 0:
-                                cal += f"  {bk}-{bk+5}%: {tt} → {round(w/tt*100, 1)}%\n"
-                        send_telegram(cal)
-                
-                # جمع‌بندی
-                for th, res in ed['results'].items():
-                    summary[expiry][th]['signals'] += res['all']['signals']
-                    summary[expiry][th]['wins'] += res['all']['wins']
-                    summary[expiry][th]['ret'] += res['all']['return_pct']
+            send_telegram(msg)
         
         # خلاصه نهایی
-        final = "🏁 <b>خلاصه نهایی</b>\n"
-        for exp in EXPIRY_OPTIONS:
-            label = {2: "30د", 3: "45د", 4: "60د"}.get(exp, f"{exp*15}د")
-            final += f"\n📅 <b>{label}:</b>\n"
-            for th in THRESHOLDS_TO_REPORT:
-                s = summary[exp][th]
-                wr = round(s['wins']/s['signals']*100, 2) if s['signals'] > 0 else 0
-                final += f"  {th}%: {s['signals']} | WR {wr}% | ΣRet {round(s['ret'], 1)}%\n"
-        send_telegram(final)
+        if results:
+            total_signals = sum(r['signals'] for r in results)
+            total_wins = sum(r['wins'] for r in results)
+            avg_wr = round(total_wins / total_signals * 100, 2) if total_signals > 0 else 0
+            total_ret = sum(r['return_pct'] for r in results)
+            avg_ret = round(total_ret / len(results), 2)
+            
+            final = (
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏆 <b>خلاصه کل</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📊 وین ریت میانگین: <b>{avg_wr}%</b>\n"
+                f"📈 مجموع سیگنال: {total_signals}\n"
+                f"💰 میانگین بازدهی: <b>+{avg_ret}%</b>\n\n"
+                f"✅ آماده برای تست لایو"
+            )
+            send_telegram(final)
     finally:
         backtest_running = False
 
+# ================== Live Signal ==================
+def analyze_live(symbol):
+    """تحلیل لحظه‌ای برای یک نماد"""
+    try:
+        td = TDClient(apikey=TWELVE_DATA_API_KEY)
+        ts = td.time_series(symbol=symbol, interval=INTERVAL, outputsize=500, timezone="UTC")
+        df = ts.as_pandas()
+        if df is None or df.empty or len(df) < 250:
+            return None
+        
+        ts_h = td.time_series(symbol=symbol, interval=HTF_INTERVAL, outputsize=200, timezone="UTC")
+        df_h = ts_h.as_pandas()
+        
+        df = df.rename(columns=str.lower).sort_index()
+        df_h = df_h.rename(columns=str.lower).sort_index()
+        
+        htf_feat = build_htf_features(df_h)
+        df = build_ltf_features(df)
+        df = merge_htf_ltf(df, htf_feat)
+        df = df.dropna()
+        
+        if len(df) < 250:
+            return None
+        
+        # آخرین کندل بسته شده
+        last_row = df.iloc[-1]
+        if last_row[FEATURE_COLS].isna().any():
+            return None
+        
+        model = trained_models.get(symbol)
+        if model is None:
+            return None
+        
+        X = last_row[FEATURE_COLS].values.astype(float).reshape(1, -1)
+        prob = model.predict_proba(X)[0]
+        confidence = max(prob) * 100
+        
+        if confidence < THRESHOLD:
+            return None
+        
+        direction = "CALL" if prob[1] > prob[0] else "PUT"
+        entry_price = float(last_row['close'])
+        entry_time = df.index[-1]
+        expiry_time = entry_time + timedelta(minutes=30)
+        
+        return {
+            "symbol": symbol.replace("=X", ""),
+            "direction": direction,
+            "confidence": round(confidence, 1),
+            "entry_price": entry_price,
+            "entry_time": entry_time,
+            "expiry_time": expiry_time,
+        }
+    except Exception as e:
+        print(f"analyze error for {symbol}: {e}")
+        return None
+
+def live_loop():
+    """حلقه اصلی تحلیل زنده - هر ۱۵ دقیقه، ۵ ثانیه بعد از بسته شدن کندل"""
+    global live_running
+    last_signal_time = {}
+    
+    while live_running:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            minute = now_utc.minute
+            second = now_utc.second
+            
+            # بررسی: آیا دقیقه بر ۱۵ بخش‌پذیر است و ۵ ثانیه گذشته؟
+            if minute % 15 == 0 and 5 <= second <= 20:
+                # جلوگیری از اجرای چندباره
+                slot_key = now_utc.strftime("%Y%m%d%H%M")
+                if slot_key == last_signal_time.get("_slot"):
+                    time.sleep(5)
+                    continue
+                last_signal_time["_slot"] = slot_key
+                
+                print(f"🔍 بررسی سیگنال‌ها در {now_utc}")
+                
+                for name, sym in SYMBOLS.items():
+                    try:
+                        result = analyze_live(sym)
+                        if result is None:
+                            continue
+                        
+                        # جلوگیری از ارسال تکراری
+                        sig_key = f"{result['symbol']}_{result['entry_time'].strftime('%Y%m%d%H%M')}"
+                        if sig_key == last_signal_time.get(result['symbol']):
+                            continue
+                        last_signal_time[result['symbol']] = sig_key
+                        
+                        # ارسال به تلگرام
+                        emoji = "🟢" if result['direction'] == "CALL" else "🔴"
+                        msg = (
+                            f"{emoji} <b>سیگنال {result['direction']}</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"📊 نماد: <b>{result['symbol']}</b>\n"
+                            f"🕐 ورود: <b>{fmt_iran(result['entry_time'])}</b> (به وقت ایران)\n"
+                            f"⏱ اکسپایر: <b>۳۰ دقیقه</b>\n"
+                            f"🔔 پایان: <b>{fmt_iran(result['expiry_time'])}</b>\n"
+                            f"💵 قیمت: {result['entry_price']:.5f}\n"
+                            f"🎯 اطمینان: <b>{result['confidence']}%</b>"
+                        )
+                        send_telegram(msg)
+                        print(f"✅ سیگنال ارسال شد: {result['symbol']} {result['direction']}")
+                    except Exception as e:
+                        print(f"error in analyze {name}: {e}")
+                    time.sleep(2)  # بین جفت‌ارزها
+            
+            time.sleep(5)
+        except Exception as e:
+            print(f"live_loop error: {e}")
+            time.sleep(10)
+
 @app.route('/')
 def health():
-    return "ML v4 running"
+    return "Signal Server is running!"
 
 @app.route('/backtest', methods=['GET'])
 def backtest_route():
     threading.Thread(target=run_backtest_background, daemon=True).start()
-    return jsonify({"status": "ok"}), 200
+    return jsonify({"status": "ok", "message": "بک‌تست شروع شد"}), 200
+
+@app.route('/start_live', methods=['GET'])
+def start_live_route():
+    global live_running
+    if live_running:
+        return jsonify({"status": "already running"}), 200
+    if not trained_models:
+        return jsonify({"status": "error", "message": "اول بک‌تست بزن"}), 400
+    live_running = True
+    threading.Thread(target=live_loop, daemon=True).start()
+    send_telegram("🟢 حالت سیگنال زنده فعال شد. از این به بعد سیگنال‌ها ارسال می‌شن.")
+    return jsonify({"status": "started"}), 200
+
+@app.route('/stop_live', methods=['GET'])
+def stop_live_route():
+    global live_running
+    live_running = False
+    send_telegram("🔴 حالت سیگنال زنده متوقف شد.")
+    return jsonify({"status": "stopped"}), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
