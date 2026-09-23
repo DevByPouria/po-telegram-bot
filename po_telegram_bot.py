@@ -398,7 +398,12 @@ def analyze_live(symbol):
     except Exception as e:
         print(f"analyze error for {symbol}: {e}")
         return None
-
+# ================== فیلتر ساعتی ==================
+def is_active_session():
+    """فقط ۸:۰۰ تا ۲۱:۰۰ UTC = ۱۱:۳۰ تا ۰۰:۳۰ ایران"""
+    now_utc = datetime.now(timezone.utc)
+    return 8 <= now_utc.hour < 21
+    
 def live_loop():
     global live_running
     last_signal_time = {}
@@ -408,7 +413,11 @@ def live_loop():
             now_utc = datetime.now(timezone.utc)
             minute = now_utc.minute
             second = now_utc.second
-            
+            # چک ساعت فعال
+            if not is_active_session():
+                time.sleep(60)
+                continue
+                
             if minute % 15 == 0 and 5 <= second <= 25:
                 slot_key = now_utc.strftime("%Y%m%d%H%M")
                 if slot_key == last_signal_time.get("_slot"):
