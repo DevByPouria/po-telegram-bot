@@ -15,6 +15,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY")
 
+# ================== ۱۰ جفت‌ارز ==================
 SYMBOLS = {
     "EUR/USD": "EUR/USD",
     "USD/JPY": "USD/JPY",
@@ -24,18 +25,12 @@ SYMBOLS = {
     "USD/CHF": "USD/CHF",
     "EUR/JPY": "EUR/JPY",
     "GBP/JPY": "GBP/JPY",
-    "EUR/GBP": "EUR/GBP",
-    "EUR/CHF": "EUR/CHF",
-    "GBP/CHF": "GBP/CHF",
-    "AUD/CAD": "AUD/CAD",
     "AUD/JPY": "AUD/JPY",
-    "CAD/JPY": "CAD/JPY",
     "CHF/JPY": "CHF/JPY",
 }
 
-THRESHOLDS = [75, 78, 80, 82, 85]
 INTERVAL = "5min"
-OUTPUTSIZE = 3000
+OUTPUTSIZE = 5000
 EXPIRY = 3
 
 backtest_running = False
@@ -70,7 +65,7 @@ def hammer(df, i):
     if body == 0: return False
     lower_wick = min(c['close'], c['open']) - c['low']
     upper_wick = c['high'] - max(c['close'], c['open'])
-    return lower_wick >= 2.5 * body and upper_wick <= body * 0.7
+    return lower_wick >= 2 * body and upper_wick <= body * 0.8
 
 def shooting_star(df, i):
     c = df.iloc[i]
@@ -78,107 +73,67 @@ def shooting_star(df, i):
     if body == 0: return False
     upper_wick = c['high'] - max(c['close'], c['open'])
     lower_wick = min(c['close'], c['open']) - c['low']
-    return upper_wick >= 2.5 * body and lower_wick <= body * 0.7
+    return upper_wick >= 2 * body and lower_wick <= body * 0.8
 
-def morning_star(df, i):
-    if i < 2: return False
-    c1, c2, c3 = df.iloc[i-2], df.iloc[i-1], df.iloc[i]
-    body1 = abs(c1['close'] - c1['open'])
-    body2 = abs(c2['close'] - c2['open'])
-    body3 = abs(c3['close'] - c3['open'])
-    if body1 == 0: return False
-    return (c1['close'] < c1['open'] and body1 > body2 * 1.2
-            and c3['close'] > c3['open'] and body3 > body2 * 1.2
-            and c3['close'] > (c1['open'] + c1['close']) / 2)
+def bullish_pattern(df, i):
+    return bullish_engulfing(df, i) or hammer(df, i)
 
-def evening_star(df, i):
-    if i < 2: return False
-    c1, c2, c3 = df.iloc[i-2], df.iloc[i-1], df.iloc[i]
-    body1 = abs(c1['close'] - c1['open'])
-    body2 = abs(c2['close'] - c2['open'])
-    body3 = abs(c3['close'] - c3['open'])
-    if body1 == 0: return False
-    return (c1['close'] > c1['open'] and body1 > body2 * 1.2
-            and c3['close'] < c3['open'] and body3 > body2 * 1.2
-            and c3['close'] < (c1['open'] + c1['close']) / 2)
+def bearish_pattern(df, i):
+    return bearish_engulfing(df, i) or shooting_star(df, i)
 
-def piercing(df, i):
-    if i < 1: return False
-    p, c = df.iloc[i-1], df.iloc[i]
-    if p['close'] >= p['open']: return False
-    if c['close'] <= c['open']: return False
-    mid = (p['open'] + p['close']) / 2
-    return c['open'] < p['close'] and c['close'] > mid and c['close'] < p['open']
-
-def dark_cloud(df, i):
-    if i < 1: return False
-    p, c = df.iloc[i-1], df.iloc[i]
-    if p['close'] <= p['open']: return False
-    if c['close'] >= c['open']: return False
-    mid = (p['open'] + p['close']) / 2
-    return c['open'] > p['close'] and c['close'] < mid and c['close'] > p['open']
-
-def trend_context_bullish(df, i, lookback=5):
-    if i < lookback: return False
-    count = 0
-    for j in range(i-lookback, i):
-        if df.iloc[j]['close'] < df.iloc[j]['open']:
-            count += 1
-    return count >= 3
-
-def trend_context_bearish(df, i, lookback=5):
-    if i < lookback: return False
-    count = 0
-    for j in range(i-lookback, i):
-        if df.iloc[j]['close'] > df.iloc[j]['open']:
-            count += 1
-    return count >= 3
-
+# ================== اندیکاتورها ==================
 def calc_indicators(df):
     df['rsi'] = ta.momentum.RSIIndicator(df['close'], 14).rsi()
     bb = ta.volatility.BollingerBands(df['close'], 20, 2)
     df['bb_high'] = bb.bollinger_hband()
     df['bb_low'] = bb.bollinger_lband()
-    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], 14).average_true_range()
-    df['atr_ma'] = df['atr'].rolling(50).mean()
+    adx_ind = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], 14)
+    df['adx'] = adx_ind.adx()
+    df['di_plus'] = adx_ind.adx_pos()
+    df['di_minus'] = adx_ind.adx_neg()
+    df['ema50'] = ta.trend.EMAIndicator(df['close'], 50).ema_indicator()
     return df
 
-def score_signal(df, i):
+# ================== تشخیص سیگنال ==================
+def get_signal(df, i):
     row = df.iloc[i]
-    sc_call, sc_put = 0, 0
-
-    if not pd.isna(row['rsi']):
-        if row['rsi'] < 22: sc_call += 25
-        elif row['rsi'] < 28: sc_call += 15
-        elif row['rsi'] > 78: sc_put += 25
-        elif row['rsi'] > 72: sc_put += 15
-
-    if not pd.isna(row['bb_low']) and not pd.isna(row['bb_high']):
-        price = row['close']
-        if price <= row['bb_low']: sc_call += 20
-        elif price >= row['bb_high']: sc_put += 20
-
-    bull = bullish_engulfing(df, i) or hammer(df, i) or morning_star(df, i) or piercing(df, i)
-    bear = bearish_engulfing(df, i) or shooting_star(df, i) or evening_star(df, i) or dark_cloud(df, i)
-    if bull: sc_call += 30
-    if bear: sc_put += 30
-
-    if trend_context_bullish(df, i): sc_call += 25
-    if trend_context_bearish(df, i): sc_put += 25
-
-    if not pd.isna(row['atr']) and not pd.isna(row['atr_ma']):
-        if row['atr'] < row['atr_ma'] * 0.6:
-            return 0, None
-
-    if sc_call > sc_put and sc_call > 0:
-        return sc_call, 'CALL'
-    elif sc_put > sc_call and sc_put > 0:
-        return sc_put, 'PUT'
-    return 0, None
+    
+    if pd.isna(row['adx']) or pd.isna(row['rsi']) or pd.isna(row['bb_high']):
+        return None
+    
+    adx = row['adx']
+    rsi = row['rsi']
+    price = row['close']
+    di_plus = row['di_plus']
+    di_minus = row['di_minus']
+    
+    # ===== حالت ۱: روند قوی (Momentum) =====
+    if adx > 25:
+        # CALL: روند صعودی + کندل صعودی
+        if di_plus > di_minus and price > row['ema50']:
+            if bullish_pattern(df, i):
+                return "CALL"
+        # PUT: روند نزولی + کندل نزولی
+        if di_minus > di_plus and price < row['ema50']:
+            if bearish_pattern(df, i):
+                return "PUT"
+    
+    # ===== حالت ۲: رنج (Reversion) =====
+    else:  # adx <= 25
+        # CALL: اشباع فروش
+        if rsi < 25 and price <= row['bb_low']:
+            if bullish_pattern(df, i):
+                return "CALL"
+        # PUT: اشباع خرید
+        if rsi > 75 and price >= row['bb_high']:
+            if bearish_pattern(df, i):
+                return "PUT"
+    
+    return None
 
 def backtest_symbol(name, symbol):
     try:
-        print(f"⏳ دانلود {name} از TwelveData...")
+        print(f"⏳ دانلود {name}...")
         td = TDClient(apikey=TWELVE_DATA_API_KEY)
         ts = td.time_series(
             symbol=symbol,
@@ -196,30 +151,51 @@ def backtest_symbol(name, symbol):
         df = calc_indicators(df)
         print(f"✅ {name}: {len(df)} کندل")
 
-        all_signals = []
+        wins_call, losses_call = 0, 0
+        wins_put, losses_put = 0, 0
+        trend_signals, range_signals = 0, 0
+
         for i in range(50, len(df) - EXPIRY):
-            sc, direction = score_signal(df, i)
-            if direction is None or sc == 0:
+            direction = get_signal(df, i)
+            if direction is None:
                 continue
+            
             entry = df['close'].iloc[i]
             exit_p = df['close'].iloc[i + EXPIRY]
-            if direction == 'CALL':
-                win = exit_p > entry
+            adx_val = df['adx'].iloc[i]
+            
+            if adx_val > 25:
+                trend_signals += 1
             else:
-                win = exit_p < entry
-            all_signals.append({"score": sc, "win": win})
+                range_signals += 1
+            
+            if direction == 'CALL':
+                if exit_p > entry:
+                    wins_call += 1
+                else:
+                    losses_call += 1
+            else:
+                if exit_p < entry:
+                    wins_put += 1
+                else:
+                    losses_put += 1
 
-        results = {}
-        for th in THRESHOLDS:
-            filtered = [s for s in all_signals if s["score"] >= th]
-            wins = sum(1 for s in filtered if s["win"])
-            losses = len(filtered) - wins
-            wr = (wins / len(filtered) * 100) if len(filtered) > 0 else 0
-            results[th] = {"signals": len(filtered), "wins": wins, "losses": losses, "win_rate": round(wr, 2)}
+        total_wins = wins_call + wins_put
+        total_losses = losses_call + losses_put
+        total = total_wins + total_losses
+        wr = (total_wins / total * 100) if total > 0 else 0
 
-        del df, all_signals
+        del df
         gc.collect()
-        return {"symbol": name, "results": results}
+        return {
+            "symbol": name,
+            "signals": total,
+            "wins": total_wins,
+            "losses": total_losses,
+            "win_rate": round(wr, 2),
+            "trend_signals": trend_signals,
+            "range_signals": range_signals
+        }
     except Exception as e:
         return {"symbol": name, "error": str(e)}
 
@@ -230,11 +206,13 @@ def run_backtest_background():
         return
     backtest_running = True
     try:
-        send_telegram("📊 <b>بک‌تست TwelveData شروع شد</b>\n"
-                      "⏱ ۵ دقیقه | اکسپایر ۱۵ دقیقه | ۱۵ جفت‌ارز\n"
-                      "🎯 آستانه‌ها: 75/78/80/82/85")
+        send_telegram("📊 <b>بک‌تست استراتژی ADX+Momentum شروع شد</b>\n"
+                      "⏱ ۵ دقیقه | اکسپایر ۱۵ دقیقه\n"
+                      "🧠 ADX + RSI + BB + الگوی کندلی\n"
+                      "🎯 ۱۰ جفت‌ارز")
 
-        total = {th: {"wins": 0, "losses": 0, "signals": 0} for th in THRESHOLDS}
+        total_w, total_l, total_s = 0, 0, 0
+        total_trend, total_range = 0, 0
 
         for name, sym in SYMBOLS.items():
             r = backtest_symbol(name, sym)
@@ -242,23 +220,28 @@ def run_backtest_background():
                 send_telegram(f"❌ <b>{r['symbol']}</b>: {r['error']}")
                 continue
 
-            msg = f"<b>{r['symbol']}</b>\n"
-            for th in THRESHOLDS:
-                res = r["results"][th]
-                msg += f"  {th}: {res['signals']} | {res['wins']}W/{res['losses']}L | <b>{res['win_rate']}%</b>\n"
-                total[th]["wins"] += res["wins"]
-                total[th]["losses"] += res["losses"]
-                total[th]["signals"] += res["signals"]
+            msg = (f"<b>{r['symbol']}</b>\n"
+                   f"📈 سیگنال: {r['signals']}\n"
+                   f"✅ {r['wins']}W / ❌ {r['losses']}L\n"
+                   f"🎯 وین ریت: <b>{r['win_rate']}%</b>\n"
+                   f"📊 روند: {r['trend_signals']} | رنج: {r['range_signals']}")
             send_telegram(msg)
 
-        final = "🏁 <b>جمع کل:</b>\n\n"
-        for th in THRESHOLDS:
-            t = total[th]
-            tot = t["wins"] + t["losses"]
-            wr = (t["wins"] / tot * 100) if tot > 0 else 0
-            final += f"<b>آستانه {th}:</b>\n"
-            final += f"  📈 {t['signals']} سیگنال | ✅ {t['wins']} | ❌ {t['losses']}\n"
-            final += f"  🎯 وین ریت: <b>{round(wr, 2)}%</b>\n\n"
+            total_w += r['wins']
+            total_l += r['losses']
+            total_s += r['signals']
+            total_trend += r['trend_signals']
+            total_range += r['range_signals']
+
+        tot = total_w + total_l
+        overall = (total_w / tot * 100) if tot > 0 else 0
+        final = (f"🏁 <b>جمع کل:</b>\n\n"
+                 f"📈 سیگنال: {total_s}\n"
+                 f"✅ برد: {total_w} | ❌ باخت: {total_l}\n"
+                 f"🎯 <b>وین ریت: {round(overall, 2)}%</b>\n\n"
+                 f"📊 تفکیک:\n"
+                 f"  روند قوی (ADX>25): {total_trend} سیگنال\n"
+                 f"  رنج (ADX≤25): {total_range} سیگنال")
         send_telegram(final)
     finally:
         backtest_running = False
