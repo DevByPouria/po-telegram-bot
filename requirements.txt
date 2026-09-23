@@ -5,3 +5,4 @@ pandas
 numpy
 yfinance
 ta
+twelvedata
