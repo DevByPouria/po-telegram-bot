@@ -5,3 +5,4 @@ pandas
 numpy
 ta
 twelvedata
+scikit-learn
