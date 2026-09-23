@@ -14,17 +14,32 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
+# ================== همه جفت‌ارزهای Pocket Option ==================
 SYMBOLS = {
-    "EURUSD": "EURUSD=X",
-    "GBPUSD": "GBPUSD=X",
-    "USDJPY": "USDJPY=X",
-    "AUDUSD": "AUDUSD=X",
-    "USDCAD": "USDCAD=X",
-    "EURJPY": "EURJPY=X",
-    "XAUUSD": "GC=F",
+    "AUD/CAD": "AUDCAD=X",
+    "AUD/USD": "AUDUSD=X",
+    "CHF/JPY": "CHFJPY=X",
+    "EUR/CHF": "EURCHF=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/JPY": "USDJPY=X",
+    "GBP/CHF": "GBPCHF=X",
+    "EUR/USD": "EURUSD=X",
+    "GBP/JPY": "GBPJPY=X",
+    "GBP/CAD": "GBPCAD=X",
+    "GBP/AUD": "GBPAUD=X",
+    "AUD/JPY": "AUDJPY=X",
+    "CAD/JPY": "CADJPY=X",
+    "USD/CHF": "USDCHF=X",
+    "EUR/GBP": "EURGBP=X",
+    "EUR/JPY": "EURJPY=X",
+    "AUD/CHF": "AUDCHF=X",
+    "CAD/CHF": "CADCHF=X",
+    "USD/CAD": "USDCAD=X",
+    "EUR/CAD": "EURCAD=X",
+    "EUR/AUD": "EURAUD=X",
 }
 
-THRESHOLDS = [75, 80, 85, 90]
+THRESHOLDS = [60, 70, 80, 90]
 backtest_running = False
 
 def send_telegram(message):
@@ -65,68 +80,47 @@ def shooting_star(df, i):
     high_wick = c['high'] - max(c['close'], c['open'])
     return high_wick > 2 * body and low_wick < body
 
-def near_support(df, i, lookback=30):
-    if i < lookback: return False
-    recent_low = df['low'].iloc[i-lookback:i].min()
-    price = df['close'].iloc[i]
-    return abs(price - recent_low) / price < 0.001
-
-def near_resistance(df, i, lookback=30):
-    if i < lookback: return False
-    recent_high = df['high'].iloc[i-lookback:i].max()
-    price = df['close'].iloc[i]
-    return abs(price - recent_high) / price < 0.001
-
+# ================== محاسبه اندیکاتورها ==================
 def calc_indicators(df):
-    df['ema50'] = ta.trend.EMAIndicator(df['close'], 50).ema_indicator()
-    df['ema200'] = ta.trend.EMAIndicator(df['close'], 200).ema_indicator()
     df['rsi'] = ta.momentum.RSIIndicator(df['close'], 14).rsi()
-    df['stoch'] = ta.momentum.StochasticOscillator(df['high'], df['low'], df['close'], 14, 3).stoch()
+    bb = ta.volatility.BollingerBands(df['close'], 20, 2)
+    df['bb_high'] = bb.bollinger_hband()
+    df['bb_low'] = bb.bollinger_lband()
+    df['bb_mid'] = bb.bollinger_mavg()
     df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], 14).average_true_range()
     df['atr_ma'] = df['atr'].rolling(50).mean()
     return df
 
+# ================== امتیازدهی بازگشتی ==================
 def score_signal(df, i):
     row = df.iloc[i]
     sc_call, sc_put = 0, 0
     
-    # 1. روند قوی - EMA50 و EMA200 هم‌جهت (۳۰ امتیاز)
-    if not pd.isna(row['ema50']) and not pd.isna(row['ema200']):
-        if row['ema50'] > row['ema200'] and row['close'] > row['ema50']:
-            sc_call += 30
-        elif row['ema50'] < row['ema200'] and row['close'] < row['ema50']:
-            sc_put += 30
-    
-    # 2. RSI اشباع (۲۰ امتیاز)
+    # 1. RSI اشباع - ۳۵ امتیاز
     if not pd.isna(row['rsi']):
-        if row['rsi'] < 30: sc_call += 20
+        if row['rsi'] < 25: sc_call += 35
+        elif row['rsi'] < 30: sc_call += 20
+        elif row['rsi'] > 75: sc_put += 35
         elif row['rsi'] > 70: sc_put += 20
     
-    # 3. الگوی کندلی (۲۰ امتیاز)
-    if bullish_engulfing(df, i) or hammer(df, i): sc_call += 20
-    if bearish_engulfing(df, i) or shooting_star(df, i): sc_put += 20
+    # 2. Bollinger Bands - ۳۵ امتیاز
+    if not pd.isna(row['bb_low']) and not pd.isna(row['bb_high']):
+        price = row['close']
+        if price <= row['bb_low']: sc_call += 35
+        elif price >= row['bb_high']: sc_put += 35
     
-    # 4. استوکاستیک (۱۵ امتیاز)
-    if not pd.isna(row['stoch']):
-        if row['stoch'] < 20: sc_call += 15
-        elif row['stoch'] > 80: sc_put += 15
-    
-    # 5. حمایت/مقاومت (۱۵ امتیاز)
-    if near_support(df, i): sc_call += 15
-    if near_resistance(df, i): sc_put += 15
+    # 3. الگوی کندلی - ۳۰ امتیاز
+    if bullish_engulfing(df, i) or hammer(df, i): sc_call += 30
+    if bearish_engulfing(df, i) or shooting_star(df, i): sc_put += 30
     
     # فیلتر ATR: نوسان کافی
-    atr_ok = True
     if not pd.isna(row['atr']) and not pd.isna(row['atr_ma']):
         if row['atr'] < row['atr_ma'] * 0.5:
-            atr_ok = False
+            return 0, None
     
-    if not atr_ok:
-        return 0, None
-    
-    if sc_call > sc_put:
+    if sc_call > sc_put and sc_call > 0:
         return sc_call, 'CALL'
-    elif sc_put > sc_call:
+    elif sc_put > sc_call and sc_put > 0:
         return sc_put, 'PUT'
     return 0, None
 
@@ -143,9 +137,8 @@ def backtest_symbol(name, yf_sym, period="30d", interval="5m", expiry=3):
         df = calc_indicators(df)
         print(f"✅ {name}: {len(df)} کندل")
         
-        # ذخیره تمام سیگنال‌ها با امتیاز
         all_signals = []
-        for i in range(200, len(df) - expiry):
+        for i in range(50, len(df) - expiry):
             sc, direction = score_signal(df, i)
             if direction is None or sc == 0:
                 continue
@@ -157,7 +150,6 @@ def backtest_symbol(name, yf_sym, period="30d", interval="5m", expiry=3):
                 win = exit_p < entry
             all_signals.append({"score": sc, "direction": direction, "win": win})
         
-        # برای هر آستانه، نتایج رو جدا کن
         results = {}
         for th in THRESHOLDS:
             filtered = [s for s in all_signals if s["score"] >= th]
@@ -179,9 +171,8 @@ def run_backtest_background():
         return
     backtest_running = True
     try:
-        send_telegram("📊 <b>بک‌تست نسخه ۲ شروع شد</b>\n⏱ ۵ دقیقه | اکسپایر ۱۵ دقیقه | ۳۰ روز\n🎯 تست آستانه‌ها: 75, 80, 85, 90")
+        send_telegram("📊 <b>بک‌تست استراتژی بازگشتی شروع شد</b>\n⏱ ۵ دقیقه | اکسپایر ۱۵ دقیقه | ۳۰ روز\n🧠 RSI + Bollinger + الگوی کندلی")
         
-        # ساختار: {threshold: {wins, losses, signals}}
         total = {th: {"wins": 0, "losses": 0, "signals": 0} for th in THRESHOLDS}
         
         for name, sym in SYMBOLS.items():
@@ -199,7 +190,6 @@ def run_backtest_background():
                 total[th]["signals"] += res["signals"]
             send_telegram(msg)
         
-        # جمع کل برای هر آستانه
         final = "🏁 <b>جمع کل بر اساس آستانه:</b>\n\n"
         for th in THRESHOLDS:
             t = total[th]
