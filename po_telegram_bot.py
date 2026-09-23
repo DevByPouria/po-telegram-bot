@@ -48,7 +48,7 @@ async def get_candles(symbol, timeframe=60, count=100):
         df = pd.DataFrame(candles, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
         return df
     except Exception as e:
-        print(f"خطا در دریافت کندل: {e}")
+        print(f"❌ خطا در دریافت کندل: {e}")
         return None
 
 async def execute_trade(direction):
@@ -116,22 +116,36 @@ async def auto_off(message):
 
 @bot.message_handler(commands=['balance'])
 async def balance(message):
+    global chat_id
+    chat_id = message.chat.id
     try:
-        bal = await api.balance()
+        if api is None:
+            await bot.reply_to(message, "❌ API متصل نیست. لطفاً منتظر بمانید یا لاگ‌ها را بررسی کنید.")
+            return
+        # استفاده از timeout برای جلوگیری از هنگ کردن
+        bal = await asyncio.wait_for(api.balance(), timeout=10.0)
         await bot.reply_to(message, f"💰 موجودی: {bal}$")
+    except asyncio.TimeoutError:
+        await bot.reply_to(message, "⏳ دریافت موجودی طول کشید. لطفاً دوباره تلاش کنید.")
     except Exception as e:
-        await bot.reply_to(message, f"خطا: {e}")
+        await bot.reply_to(message, f"❌ خطا: {e}")
 
 # ================== اجرا ==================
 async def main():
     global api
+    print("⏳ در حال اتصال به Pocket Option...")
     try:
         api = PocketOptionAsync(POCKET_OPTION_SSID)
+        # تست اتصال با یک فراخوانی ساده
         await api.connect()
         print("✅ به Pocket Option متصل شد.")
     except Exception as e:
-        print(f"❌ خطا در اتصال: {e}")
-        return
+        print(f"❌ خطا در اتصال به Pocket Option: {e}")
+        # حتی اگر اتصال اولیه خطا داد، ربات رو متوقف نکن
+        # شاید بعداً بتونه وصل بشه
+        pass
+    
+    print("🚀 ربات تلگرام در حال اجراست...")
     await asyncio.gather(bot.polling(), trading_loop())
 
 if __name__ == "__main__":
