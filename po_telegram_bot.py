@@ -122,7 +122,6 @@ async def balance(message):
         if api is None:
             await bot.reply_to(message, "❌ API متصل نیست. لطفاً منتظر بمانید یا لاگ‌ها را بررسی کنید.")
             return
-        # استفاده از timeout برای جلوگیری از هنگ کردن
         bal = await asyncio.wait_for(api.balance(), timeout=10.0)
         await bot.reply_to(message, f"💰 موجودی: {bal}$")
     except asyncio.TimeoutError:
@@ -136,20 +135,20 @@ async def main():
     print("⏳ در حال اتصال به Pocket Option...")
     try:
         api = PocketOptionAsync(POCKET_OPTION_SSID)
-        # تست اتصال با یک فراخوانی ساده
         await api.connect()
-        print("✅ به Pocket Option متصل شد.")
+        # تست اتصال با یک درخواست ساده
+        bal = await asyncio.wait_for(api.balance(), timeout=15.0)
+        print(f"✅ به Pocket Option متصل شد. موجودی: {bal}$")
+    except asyncio.TimeoutError:
+        print("❌ خطا: اتصال به Pocket Option timeout خورد.")
     except Exception as e:
         print(f"❌ خطا در اتصال به Pocket Option: {e}")
-        # حتی اگر اتصال اولیه خطا داد، ربات رو متوقف نکن
-        # شاید بعداً بتونه وصل بشه
-        pass
     
     print("🚀 ربات تلگرام در حال اجراست...")
+    # پاک کردن وب‌هوک و پیام‌های قدیمی برای جلوگیری از تداخل
+    await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.gather(bot.polling(), trading_loop())
 
 if __name__ == "__main__":
-    # اجرای Flask در یک ترد جداگانه (برای Render)
     threading.Thread(target=run_flask, daemon=True).start()
-    # اجرای ربات و حلقه معاملات
     asyncio.run(main())
