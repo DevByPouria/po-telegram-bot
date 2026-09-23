@@ -14,32 +14,21 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# ================== همه جفت‌ارزهای Pocket Option ==================
+# ================== فقط ۱۰ جفت‌ارز برنده ==================
 SYMBOLS = {
-    "AUD/CAD": "AUDCAD=X",
-    "AUD/USD": "AUDUSD=X",
-    "CHF/JPY": "CHFJPY=X",
-    "EUR/CHF": "EURCHF=X",
-    "GBP/USD": "GBPUSD=X",
-    "USD/JPY": "USDJPY=X",
-    "GBP/CHF": "GBPCHF=X",
-    "EUR/USD": "EURUSD=X",
-    "GBP/JPY": "GBPJPY=X",
-    "GBP/CAD": "GBPCAD=X",
-    "GBP/AUD": "GBPAUD=X",
-    "AUD/JPY": "AUDJPY=X",
     "CAD/JPY": "CADJPY=X",
-    "USD/CHF": "USDCHF=X",
-    "EUR/GBP": "EURGBP=X",
-    "EUR/JPY": "EURJPY=X",
-    "AUD/CHF": "AUDCHF=X",
-    "CAD/CHF": "CADCHF=X",
+    "AUD/JPY": "AUDJPY=X",
+    "GBP/USD": "GBPUSD=X",
     "USD/CAD": "USDCAD=X",
-    "EUR/CAD": "EURCAD=X",
-    "EUR/AUD": "EURAUD=X",
+    "GBP/CHF": "GBPCHF=X",
+    "GBP/JPY": "GBPJPY=X",
+    "USD/CHF": "USDCHF=X",
+    "EUR/CHF": "EURCHF=X",
+    "EUR/JPY": "EURJPY=X",
+    "CAD/CHF": "CADCHF=X",
 }
 
-THRESHOLDS = [60, 70, 80, 90]
+THRESHOLDS = [75, 80, 85, 90]
 backtest_running = False
 
 def send_telegram(message):
@@ -53,32 +42,93 @@ def send_telegram(message):
     except Exception as e:
         print(f"خطا در ارسال: {e}")
 
-# ================== الگوهای کندلی ==================
+# ================== الگوهای کندلی قوی ==================
 def bullish_engulfing(df, i):
     if i < 1: return False
     p, c = df.iloc[i-1], df.iloc[i]
-    return p['close'] < p['open'] and c['close'] > c['open'] and c['close'] > p['open'] and c['open'] < p['close']
+    return (p['close'] < p['open'] and c['close'] > c['open'] 
+            and c['close'] > p['open'] and c['open'] < p['close']
+            and abs(c['close'] - c['open']) > abs(p['close'] - p['open']) * 1.2)
 
 def bearish_engulfing(df, i):
     if i < 1: return False
     p, c = df.iloc[i-1], df.iloc[i]
-    return p['close'] > p['open'] and c['close'] < c['open'] and c['close'] < p['open'] and c['open'] > p['close']
+    return (p['close'] > p['open'] and c['close'] < c['open'] 
+            and c['close'] < p['open'] and c['open'] > p['close']
+            and abs(c['close'] - c['open']) > abs(p['close'] - p['open']) * 1.2)
 
 def hammer(df, i):
     c = df.iloc[i]
     body = abs(c['close'] - c['open'])
     if body == 0: return False
-    low_wick = min(c['close'], c['open']) - c['low']
-    high_wick = c['high'] - max(c['close'], c['open'])
-    return low_wick > 2 * body and high_wick < body
+    lower_wick = min(c['close'], c['open']) - c['low']
+    upper_wick = c['high'] - max(c['close'], c['open'])
+    return lower_wick >= 3 * body and upper_wick <= body * 0.5
 
 def shooting_star(df, i):
     c = df.iloc[i]
     body = abs(c['close'] - c['open'])
     if body == 0: return False
-    low_wick = min(c['close'], c['open']) - c['low']
-    high_wick = c['high'] - max(c['close'], c['open'])
-    return high_wick > 2 * body and low_wick < body
+    upper_wick = c['high'] - max(c['close'], c['open'])
+    lower_wick = min(c['close'], c['open']) - c['low']
+    return upper_wick >= 3 * body and lower_wick <= body * 0.5
+
+def morning_star(df, i):
+    if i < 2: return False
+    c1, c2, c3 = df.iloc[i-2], df.iloc[i-1], df.iloc[i]
+    body1 = abs(c1['close'] - c1['open'])
+    body2 = abs(c2['close'] - c2['open'])
+    body3 = abs(c3['close'] - c3['open'])
+    if body1 == 0: return False
+    return (c1['close'] < c1['open'] and body1 > body2 * 1.5
+            and c3['close'] > c3['open'] and body3 > body2 * 1.5
+            and c3['close'] > (c1['open'] + c1['close']) / 2)
+
+def evening_star(df, i):
+    if i < 2: return False
+    c1, c2, c3 = df.iloc[i-2], df.iloc[i-1], df.iloc[i]
+    body1 = abs(c1['close'] - c1['open'])
+    body2 = abs(c2['close'] - c2['open'])
+    body3 = abs(c3['close'] - c3['open'])
+    if body1 == 0: return False
+    return (c1['close'] > c1['open'] and body1 > body2 * 1.5
+            and c3['close'] < c3['open'] and body3 > body2 * 1.5
+            and c3['close'] < (c1['open'] + c1['close']) / 2)
+
+def piercing(df, i):
+    if i < 1: return False
+    p, c = df.iloc[i-1], df.iloc[i]
+    if p['close'] >= p['open']: return False
+    if c['close'] <= c['open']: return False
+    mid = (p['open'] + p['close']) / 2
+    return c['open'] < p['close'] and c['close'] > mid and c['close'] < p['open']
+
+def dark_cloud(df, i):
+    if i < 1: return False
+    p, c = df.iloc[i-1], df.iloc[i]
+    if p['close'] <= p['open']: return False
+    if c['close'] >= c['open']: return False
+    mid = (p['open'] + p['close']) / 2
+    return c['open'] > p['close'] and c['close'] < mid and c['close'] > p['open']
+
+# ================== فیلتر زمینه روند ==================
+def trend_context_bullish(df, i, lookback=5):
+    """قبل از سیگنال، حداقل ۵ کندل نزولی پشت سر هم"""
+    if i < lookback: return False
+    count = 0
+    for j in range(i-lookback, i):
+        if df.iloc[j]['close'] < df.iloc[j]['open']:
+            count += 1
+    return count >= 4  # حداقل ۴ از ۵ کندل نزولی
+
+def trend_context_bearish(df, i, lookback=5):
+    """قبل از سیگنال، حداقل ۵ کندل صعودی پشت سر هم"""
+    if i < lookback: return False
+    count = 0
+    for j in range(i-lookback, i):
+        if df.iloc[j]['close'] > df.iloc[j]['open']:
+            count += 1
+    return count >= 4
 
 # ================== محاسبه اندیکاتورها ==================
 def calc_indicators(df):
@@ -86,41 +136,44 @@ def calc_indicators(df):
     bb = ta.volatility.BollingerBands(df['close'], 20, 2)
     df['bb_high'] = bb.bollinger_hband()
     df['bb_low'] = bb.bollinger_lband()
-    df['bb_mid'] = bb.bollinger_mavg()
     df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], 14).average_true_range()
     df['atr_ma'] = df['atr'].rolling(50).mean()
     return df
 
-# ================== امتیازدهی بازگشتی ==================
+# ================== امتیازدهی سخت‌گیرانه ==================
 def score_signal(df, i):
     row = df.iloc[i]
     sc_call, sc_put = 0, 0
     
-    # 1. RSI اشباع - ۳۵ امتیاز
+    # 1. RSI افراطی - ۲۵ امتیاز (فقط اشباع شدید)
     if not pd.isna(row['rsi']):
-        if row['rsi'] < 25: sc_call += 35
-        elif row['rsi'] < 30: sc_call += 20
-        elif row['rsi'] > 75: sc_put += 35
-        elif row['rsi'] > 70: sc_put += 20
+        if row['rsi'] < 20: sc_call += 25
+        elif row['rsi'] > 80: sc_put += 25
     
-    # 2. Bollinger Bands - ۳۵ امتیاز
+    # 2. Bollinger - ۲۰ امتیاز (شکست باند)
     if not pd.isna(row['bb_low']) and not pd.isna(row['bb_high']):
         price = row['close']
-        if price <= row['bb_low']: sc_call += 35
-        elif price >= row['bb_high']: sc_put += 35
+        if price < row['bb_low']: sc_call += 20
+        elif price > row['bb_high']: sc_put += 20
     
-    # 3. الگوی کندلی - ۳۰ امتیاز
-    if bullish_engulfing(df, i) or hammer(df, i): sc_call += 30
-    if bearish_engulfing(df, i) or shooting_star(df, i): sc_put += 30
+    # 3. الگوی کندلی قوی - ۳۰ امتیاز
+    bull_patterns = bullish_engulfing(df, i) or hammer(df, i) or morning_star(df, i) or piercing(df, i)
+    bear_patterns = bearish_engulfing(df, i) or shooting_star(df, i) or evening_star(df, i) or dark_cloud(df, i)
+    if bull_patterns: sc_call += 30
+    if bear_patterns: sc_put += 30
     
-    # فیلتر ATR: نوسان کافی
+    # 4. زمینه روند - ۲۵ امتیاز (الزامی)
+    if trend_context_bullish(df, i): sc_call += 25
+    if trend_context_bearish(df, i): sc_put += 25
+    
+    # فیلتر ATR
     if not pd.isna(row['atr']) and not pd.isna(row['atr_ma']):
-        if row['atr'] < row['atr_ma'] * 0.5:
+        if row['atr'] < row['atr_ma'] * 0.7:
             return 0, None
     
-    if sc_call > sc_put and sc_call > 0:
+    if sc_call > sc_put and sc_call >= 75:
         return sc_call, 'CALL'
-    elif sc_put > sc_call and sc_put > 0:
+    elif sc_put > sc_call and sc_put >= 75:
         return sc_put, 'PUT'
     return 0, None
 
@@ -135,7 +188,6 @@ def backtest_symbol(name, yf_sym, period="30d", interval="5m", expiry=3):
             df.columns = df.columns.get_level_values(0)
         df = df.rename(columns=str.lower)
         df = calc_indicators(df)
-        print(f"✅ {name}: {len(df)} کندل")
         
         all_signals = []
         for i in range(50, len(df) - expiry):
@@ -171,7 +223,9 @@ def run_backtest_background():
         return
     backtest_running = True
     try:
-        send_telegram("📊 <b>بک‌تست استراتژی بازگشتی شروع شد</b>\n⏱ ۵ دقیقه | اکسپایر ۱۵ دقیقه | ۳۰ روز\n🧠 RSI + Bollinger + الگوی کندلی")
+        send_telegram("📊 <b>بک‌تست نسخه ۴ (سخت‌گیرانه) شروع شد</b>\n"
+                      "⏱ ۵ دقیقه | اکسپایر ۱۵ دقیقه | ۳۰ روز\n"
+                      "🎯 ۱۰ جفت‌ارز برنده | آستانه 75-90 | زمینه روند الزامی")
         
         total = {th: {"wins": 0, "losses": 0, "signals": 0} for th in THRESHOLDS}
         
@@ -184,19 +238,21 @@ def run_backtest_background():
             msg = f"<b>{r['symbol']}</b>\n"
             for th in THRESHOLDS:
                 res = r["results"][th]
-                msg += f"  آستانه {th}: {res['signals']} سیگنال | {res['wins']}W/{res['losses']}L | <b>{res['win_rate']}%</b>\n"
+                msg += f"  {th}: {res['signals']} | {res['wins']}W/{res['losses']}L | <b>{res['win_rate']}%</b>\n"
                 total[th]["wins"] += res["wins"]
                 total[th]["losses"] += res["losses"]
                 total[th]["signals"] += res["signals"]
             send_telegram(msg)
         
-        final = "🏁 <b>جمع کل بر اساس آستانه:</b>\n\n"
+        final = "🏁 <b>جمع کل:</b>\n\n"
         for th in THRESHOLDS:
             t = total[th]
             tot = t["wins"] + t["losses"]
             wr = (t["wins"] / tot * 100) if tot > 0 else 0
+            avg_per_day = round(t['signals'] / 30, 1)
             final += f"<b>آستانه {th}:</b>\n"
-            final += f"  📈 {t['signals']} سیگنال | ✅ {t['wins']} | ❌ {t['losses']} | 🎯 <b>{round(wr, 2)}%</b>\n\n"
+            final += f"  📈 {t['signals']} سیگنال (روزی {avg_per_day})\n"
+            final += f"  ✅ {t['wins']} | ❌ {t['losses']} | 🎯 <b>{round(wr, 2)}%</b>\n\n"
         send_telegram(final)
     finally:
         backtest_running = False
