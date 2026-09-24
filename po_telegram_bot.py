@@ -392,8 +392,8 @@ def analyze_live(symbol):
         last_analysis[symbol] = {
             "confidence": round(float(confidence), 2),
             "direction": direction_tmp,
-            "time_utc": df.index[-1].strftime("%Y-%m-%d %H:%M"),
-            "time_iran": fmt_iran(df.index[-1]),
+            "time_utc": (df.index[-1] + timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M"),
+            "time_iran": fmt_iran(df.index[-1] + timedelta(minutes=15)),
             "status": "signal" if confidence >= THRESHOLD else "rejected",
             "threshold": THRESHOLD,
         }
@@ -403,7 +403,7 @@ def analyze_live(symbol):
         
         direction = "CALL" if prob[1] > prob[0] else "PUT"
         entry_price = float(last_row['close'])
-        entry_time = df.index[-1]
+        entry_time = df.index[-1] + timedelta(minutes=15)
         expiry_time = entry_time + timedelta(minutes=30)
         
         return {
