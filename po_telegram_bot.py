@@ -46,6 +46,10 @@ backtest_running = False
 live_running = False
 trained_models = {}
 auto_start_done = False
+# ================== آمار سیگنال‌ها ==================
+pending_signals = []  # سیگنال‌های در انتظار نتیجه
+completed_signals = []  # سیگنال‌های تکمیل‌شده
+signal_id_counter = 0
 
 def send_telegram(message):
     if not BOT_TOKEN or not CHAT_ID:
@@ -398,6 +402,57 @@ def analyze_live(symbol):
     except Exception as e:
         print(f"analyze error for {symbol}: {e}")
         return None
+        
+def check_signal_result(signal):
+    """بررسی نتیجه یک سیگنال بعد از اکسپایر"""
+    try:
+        td = TDClient(apikey=TWELVE_DATA_API_KEY)
+        ts = td.time_series(
+            symbol=signal['symbol'],
+            interval=INTERVAL,
+            outputsize=5,
+            timezone="UTC"
+        )
+        df = ts.as_pandas()
+        if df is None or df.empty:
+            return None
+        
+        df = df.rename(columns=str.lower).sort_index()
+        
+        # پیدا کردن کندل در زمان اکسپایر
+        expiry_time = signal['expiry_time']
+        
+        # آخرین کندلی که بسته شده و قبل از یا در زمان اکسپایر بوده
+        valid_candles = df[df.index <= expiry_time]
+        if valid_candles.empty:
+            return None
+        
+        exit_price = float(valid_candles.iloc[-1]['close'])
+        entry_price = signal['entry_price']
+        
+        # تعیین نتیجه
+        if signal['direction'] == 'CALL':
+            is_win = exit_price > entry_price
+        else:
+            is_win = exit_price < entry_price
+        
+        # Tie handling
+        if exit_price == entry_price:
+            return {
+                'result': 'TIE',
+                'exit_price': exit_price,
+                'is_win': None,
+            }
+        
+        return {
+            'result': 'WIN' if is_win else 'LOSS',
+            'exit_price': exit_price,
+            'is_win': is_win,
+        }
+    except Exception as e:
+        print(f"check_result error: {e}")
+        return None
+        
 # ================== فیلتر ساعتی ==================
 def is_active_session():
     """فقط ۸:۰۰ تا ۲۱:۰۰ UTC = ۱۱:۳۰ تا ۰۰:۳۰ ایران"""
