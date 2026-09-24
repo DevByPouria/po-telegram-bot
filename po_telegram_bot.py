@@ -46,9 +46,10 @@ backtest_running = False
 live_running = False
 trained_models = {}
 auto_start_done = False
+
 # ================== آمار سیگنال‌ها ==================
-pending_signals = []  # سیگنال‌های در انتظار نتیجه
-completed_signals = []  # سیگنال‌های تکمیل‌شده
+pending_signals = []
+completed_signals = []
 signal_id_counter = 0
 
 def send_telegram(message):
@@ -402,7 +403,7 @@ def analyze_live(symbol):
     except Exception as e:
         print(f"analyze error for {symbol}: {e}")
         return None
-        
+
 def check_signal_result(signal):
     """بررسی نتیجه یک سیگنال بعد از اکسپایر"""
     try:
@@ -410,7 +411,7 @@ def check_signal_result(signal):
         ts = td.time_series(
             symbol=signal['symbol'],
             interval=INTERVAL,
-            outputsize=5,
+            outputsize=10,
             timezone="UTC"
         )
         df = ts.as_pandas()
@@ -419,10 +420,7 @@ def check_signal_result(signal):
         
         df = df.rename(columns=str.lower).sort_index()
         
-        # پیدا کردن کندل در زمان اکسپایر
         expiry_time = signal['expiry_time']
-        
-        # آخرین کندلی که بسته شده و قبل از یا در زمان اکسپایر بوده
         valid_candles = df[df.index <= expiry_time]
         if valid_candles.empty:
             return None
@@ -430,19 +428,13 @@ def check_signal_result(signal):
         exit_price = float(valid_candles.iloc[-1]['close'])
         entry_price = signal['entry_price']
         
-        # تعیین نتیجه
+        if exit_price == entry_price:
+            return {'result': 'TIE', 'exit_price': exit_price, 'is_win': None}
+        
         if signal['direction'] == 'CALL':
             is_win = exit_price > entry_price
         else:
             is_win = exit_price < entry_price
-        
-        # Tie handling
-        if exit_price == entry_price:
-            return {
-                'result': 'TIE',
-                'exit_price': exit_price,
-                'is_win': None,
-            }
         
         return {
             'result': 'WIN' if is_win else 'LOSS',
@@ -452,15 +444,85 @@ def check_signal_result(signal):
     except Exception as e:
         print(f"check_result error: {e}")
         return None
-        
+
+def send_signal_result(signal):
+    """ارسال نتیجه سیگنال به تلگرام"""
+    if signal['result'] == 'WIN':
+        title = "✅ <b>معامله برد</b>"
+    elif signal['result'] == 'LOSS':
+        title = "❌ <b>معامله باخت</b>"
+    else:
+        title = "⚪ <b>معامله مساوی</b>"
+    
+    msg = (
+        f"{title}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 نماد: <b>{signal['symbol']}</b>\n"
+        f"🎯 جهت: <b>{signal['direction']}</b>\n"
+        f"🕐 ورود: {fmt_iran(signal['entry_time'])} ایران\n"
+        f"🔔 پایان: {fmt_iran(signal['expiry_time'])} ایران\n"
+        f"💵 ورود: {signal['entry_price']:.5f}\n"
+        f"💵 خروج: {signal['exit_price']:.5f}\n"
+    )
+    
+    total = len(completed_signals)
+    wins = sum(1 for s in completed_signals if s.get('is_win') is True)
+    losses = sum(1 for s in completed_signals if s.get('is_win') is False)
+    ties = sum(1 for s in completed_signals if s.get('is_win') is None)
+    
+    if total > 0:
+        decided = wins + losses
+        wr = round(wins / decided * 100, 1) if decided > 0 else 0
+        msg += (
+            f"\n📈 <b>آمار کلی:</b>\n"
+            f"   کل: {total} | برد: {wins} | باخت: {losses}"
+        )
+        if ties > 0:
+            msg += f" | مساوی: {ties}"
+        msg += f"\n   🎯 وین ریت: <b>{wr}%</b>"
+    
+    send_telegram(msg)
+
+def result_checker_loop():
+    """حلقه بررسی نتایج سیگنال‌ها"""
+    global pending_signals, completed_signals
+    
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            
+            for signal in list(pending_signals):
+                check_time = signal['expiry_time'] + timedelta(minutes=1)
+                
+                if now_utc >= check_time:
+                    print(f"🔍 بررسی نتیجه {signal['symbol']} {signal['direction']}")
+                    result = check_signal_result(signal)
+                    
+                    if result is None:
+                        continue
+                    
+                    pending_signals.remove(signal)
+                    signal['result'] = result['result']
+                    signal['exit_price'] = result['exit_price']
+                    signal['is_win'] = result['is_win']
+                    completed_signals.append(signal)
+                    
+                    send_signal_result(signal)
+                    print(f"📊 نتیجه: {signal['symbol']} → {signal['result']}")
+            
+            time.sleep(30)
+        except Exception as e:
+            print(f"result_checker error: {e}")
+            time.sleep(60)
+
 # ================== فیلتر ساعتی ==================
 def is_active_session():
     """فقط ۸:۰۰ تا ۲۱:۰۰ UTC = ۱۱:۳۰ تا ۰۰:۳۰ ایران"""
     now_utc = datetime.now(timezone.utc)
     return 8 <= now_utc.hour < 21
-    
+
 def live_loop():
-    global live_running
+    global live_running, signal_id_counter
     last_signal_time = {}
     
     while live_running:
@@ -468,11 +530,12 @@ def live_loop():
             now_utc = datetime.now(timezone.utc)
             minute = now_utc.minute
             second = now_utc.second
+            
             # چک ساعت فعال
             if not is_active_session():
                 time.sleep(60)
                 continue
-                
+            
             if minute % 15 == 0 and 5 <= second <= 25:
                 slot_key = now_utc.strftime("%Y%m%d%H%M")
                 if slot_key == last_signal_time.get("_slot"):
@@ -508,6 +571,14 @@ def live_loop():
                         )
                         send_telegram(msg)
                         print(f"✅ سیگنال: {result['symbol']} {result['direction']}")
+                        
+                        # ذخیره سیگنال برای بررسی نتیجه
+                        signal_id_counter += 1
+                        result['id'] = signal_id_counter
+                        result['saved_at'] = now_utc
+                        pending_signals.append(result)
+                        print(f"📌 سیگنال ذخیره شد برای بررسی نتیجه")
+                        
                     except Exception as e:
                         print(f"error {name}: {e}")
                     time.sleep(2)
@@ -522,7 +593,7 @@ def auto_start():
     """خودکار راه‌اندازی: اگه مدل نیست، بک‌تست بزن، بعد live رو فعال کن"""
     global live_running, auto_start_done
     
-    time.sleep(15)  # صبر تا Flask آماده بشه
+    time.sleep(15)
     
     print("=" * 50)
     print("🤖 راه‌اندازی خودکار شروع شد")
@@ -531,28 +602,28 @@ def auto_start():
     try:
         send_telegram("🤖 <b>راه‌اندازی خودکار</b>\n\nدر حال آماده‌سازی ربات...")
         
-        # چک کن مدل هست یا نه
         if not trained_models:
             print("📚 مدل‌ها وجود ندارن. شروع بک‌تست...")
             run_backtest_background()
             
-            # صبر تا بک‌تست تموم بشه
             while backtest_running:
                 time.sleep(5)
             
             print(f"✅ بک‌تست تموم شد. {len(trained_models)} مدل آموزش دید.")
         
-        # فعال کردن live
         if trained_models and not live_running:
             live_running = True
             threading.Thread(target=live_loop, daemon=True).start()
+            threading.Thread(target=result_checker_loop, daemon=True).start()
             print("🟢 حالت سیگنال زنده فعال شد.")
+            print("📊 چکر نتایج هم فعال شد.")
             send_telegram(
                 "🟢 <b>ربات آماده است!</b>\n\n"
                 f"🎯 {len(trained_models)} مدل آموزش‌دیده\n"
                 f"⏱ اکسپایر: ۳۰ دقیقه\n"
                 f"🎯 آستانه: {THRESHOLD}%\n\n"
                 "از این به بعد، سیگنال‌ها خودکار ارسال می‌شن.\n"
+                "نتیجه هر سیگنال هم ۳۱ دقیقه بعد گزارش می‌شه. 📊\n\n"
                 "موفق باشی! 🚀"
             )
         auto_start_done = True
@@ -564,7 +635,7 @@ def auto_start():
 
 @app.route('/')
 def health():
-    return f"Signal Server | Models: {len(trained_models)} | Live: {live_running}"
+    return f"Signal Server | Models: {len(trained_models)} | Live: {live_running} | Pending: {len(pending_signals)} | Done: {len(completed_signals)}"
 
 @app.route('/backtest', methods=['GET'])
 def backtest_route():
@@ -580,6 +651,7 @@ def start_live_route():
         return jsonify({"status": "error", "message": "مدل آموزش ندیده. صبر کن یا /backtest بزن"}), 400
     live_running = True
     threading.Thread(target=live_loop, daemon=True).start()
+    threading.Thread(target=result_checker_loop, daemon=True).start()
     send_telegram("🟢 حالت سیگنال زنده فعال شد.")
     return jsonify({"status": "started"}), 200
 
@@ -597,10 +669,37 @@ def status_route():
         "live_running": live_running,
         "backtest_running": backtest_running,
         "auto_start_done": auto_start_done,
+        "pending": len(pending_signals),
+        "completed": len(completed_signals),
+    }), 200
+
+@app.route('/stats', methods=['GET'])
+def stats_route():
+    total = len(completed_signals)
+    wins = sum(1 for s in completed_signals if s.get('is_win') is True)
+    losses = sum(1 for s in completed_signals if s.get('is_win') is False)
+    ties = sum(1 for s in completed_signals if s.get('is_win') is None)
+    decided = wins + losses
+    wr = round(wins / decided * 100, 2) if decided > 0 else 0
+    return jsonify({
+        "total": total,
+        "wins": wins,
+        "losses": losses,
+        "ties": ties,
+        "pending": len(pending_signals),
+        "win_rate": wr,
+        "recent": [
+            {
+                "symbol": s['symbol'],
+                "direction": s['direction'],
+                "result": s['result'],
+                "time": fmt_iran(s['entry_time']),
+            }
+            for s in completed_signals[-10:]
+        ]
     }), 200
 
 # ================== راه‌اندازی خودکار در سطح ماژول ==================
-# این خط مهمه: وقتی Gunicorn فایل رو import می‌کنه، این thread اجرا می‌شه
 _startup_thread = threading.Thread(target=auto_start, daemon=True)
 _startup_thread.start()
 
