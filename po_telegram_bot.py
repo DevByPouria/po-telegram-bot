@@ -721,7 +721,36 @@ def analysis_route():
     
     return jsonify(result), 200
 
-@app.route('/stats', methods=['GET']) def stats_route(): total = len(completed_signals) wins = sum(1 for s in completed_signals if s.get('is_win') is True) losses = sum(1 for s in completed_signals if s.get('is_win') is False) ties = sum(1 for s in completed_signals if s.get('is_win') is None) decided = wins + losses wr = round(wins / decided * 100, 2) if decided > 0 else 0 return jsonify({ "total": total, "wins": wins, "losses": losses, "ties": ties, "pending": len(pending_signals), "win_rate": wr, "recent": [ { "symbol": s['symbol'], "direction": s['direction'], "result": s['result'], "time": fmt_iran(s['entry_time']), } for s in completed_signals[-10:] ] }), 200
-# ================== راه‌اندازی خودکار در سطح ماژول ==================
-_startup_thread = threading.Thread(target=auto_start, daemon=True) _startup_thread.start()
-if name == "main": port = int(os.environ.get("PORT", 5000)) app.run(host='0.0.0.0', port=port)
+@app.route('/stats', methods=['GET'])
+def stats_route():
+    total = len(completed_signals)
+    wins = sum(1 for s in completed_signals if s.get('is_win') is True)
+    losses = sum(1 for s in completed_signals if s.get('is_win') is False)
+    ties = sum(1 for s in completed_signals if s.get('is_win') is None)
+    decided = wins + losses
+    wr = round(wins / decided * 100, 2) if decided > 0 else 0
+    recent_data = []
+    for s in completed_signals[-10:]:
+        recent_data.append({
+            "symbol": s['symbol'],
+            "direction": s['direction'],
+            "result": s['result'],
+            "time": fmt_iran(s['entry_time']),
+        })
+    return jsonify({
+        "total": total,
+        "wins": wins,
+        "losses": losses,
+        "ties": ties,
+        "pending": len(pending_signals),
+        "win_rate": wr,
+        "recent": recent_data,
+    }), 200
+
+# ==================== AUTO START AT MODULE LEVEL ====================
+_startup_thread = threading.Thread(target=auto_start, daemon=True)
+_startup_thread.start()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
