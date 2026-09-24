@@ -52,6 +52,9 @@ pending_signals = []
 completed_signals = []
 signal_id_counter = 0
 
+# ================== آخرین تحلیل هر جفت‌ارز ==================
+last_analysis = {}  # {symbol: {"confidence": X, "direction": Y, "time": Z, "status": "..."}}
+
 def send_telegram(message):
     if not BOT_TOKEN or not CHAT_ID:
         return
@@ -384,6 +387,17 @@ def analyze_live(symbol):
         prob = model.predict_proba(X)[0]
         confidence = max(prob) * 100
         
+        # ================== ذخیره آخرین تحلیل ==================
+        direction_tmp = "CALL" if prob[1] > prob[0] else "PUT"
+        last_analysis[symbol] = {
+            "confidence": round(float(confidence), 2),
+            "direction": direction_tmp,
+            "time_utc": df.index[-1].strftime("%Y-%m-%d %H:%M"),
+            "time_iran": fmt_iran(df.index[-1]),
+            "status": "signal" if confidence >= THRESHOLD else "rejected",
+            "threshold": THRESHOLD,
+        }
+        
         if confidence < THRESHOLD:
             return None
         
@@ -402,6 +416,14 @@ def analyze_live(symbol):
         }
     except Exception as e:
         print(f"analyze error for {symbol}: {e}")
+        last_analysis[symbol] = {
+            "confidence": 0,
+            "direction": "ERROR",
+            "time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            "time_iran": fmt_iran(datetime.now(timezone.utc)),
+            "status": "error",
+            "error": str(e)[:200],
+        }
         return None
 
 def check_signal_result(signal):
@@ -673,6 +695,32 @@ def status_route():
         "completed": len(completed_signals),
     }), 200
 
+@app.route('/analysis', methods=['GET'])
+def analysis_route():
+    """آخرین تحلیل هر جفت‌ارز"""
+    now_utc = datetime.now(timezone.utc)
+    result = {
+        "current_time_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
+        "current_time_iran": to_iran(now_utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "active_session": is_active_session(),
+        "threshold": THRESHOLD,
+        "symbols": {}
+    }
+    
+    for name, sym in SYMBOLS.items():
+        if sym in last_analysis:
+            info = last_analysis[sym].copy()
+            info["name"] = name
+            result["symbols"][name] = info
+        else:
+            result["symbols"][name] = {
+                "name": name,
+                "status": "not_analyzed_yet",
+                "message": "هنوز تحلیل نشده"
+            }
+    
+    return jsonify(result), 200
+
 @app.route('/stats', methods=['GET'])
 def stats_route():
     total = len(completed_signals)
@@ -691,18 +739,3 @@ def stats_route():
         "recent": [
             {
                 "symbol": s['symbol'],
-                "direction": s['direction'],
-                "result": s['result'],
-                "time": fmt_iran(s['entry_time']),
-            }
-            for s in completed_signals[-10:]
-        ]
-    }), 200
-
-# ================== راه‌اندازی خودکار در سطح ماژول ==================
-_startup_thread = threading.Thread(target=auto_start, daemon=True)
-_startup_thread.start()
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
