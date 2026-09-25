@@ -18,7 +18,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY")
 
-# ================== تنظیمات ==================
+# ================== SETTINGS ==================
 SYMBOLS = {
     "EUR/USD": "EUR/USD",
     "USD/JPY": "USD/JPY",
@@ -39,21 +39,28 @@ INITIAL_BANKROLL = 1000.0
 PAYOUT = 0.85
 STAKE_PCT = 0.01
 
+# حداکثر سیگنال هم‌جهت پشت سر هم (برای جلوگیری از Bias)
+MAX_SAME_DIRECTION_STREAK = 3
+
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
-# ================== وضعیت ==================
+# ================== STATE ==================
 backtest_running = False
 live_running = False
 trained_models = {}
 auto_start_done = False
 
-# ================== آمار سیگنال‌ها ==================
+# ================== SIGNAL STATS ==================
 pending_signals = []
 completed_signals = []
 signal_id_counter = 0
 
-# ================== آخرین تحلیل هر جفت‌ارز ==================
-last_analysis = {}  # {symbol: {"confidence": X, "direction": Y, "time": Z, "status": "..."}}
+# ================== LAST ANALYSIS ==================
+last_analysis = {}
+
+# ================== BIAS TRACKING ==================
+# {symbol: {"direction": "PUT", "count": 3}}
+direction_streak = {}
 
 def send_telegram(message):
     if not BOT_TOKEN or not CHAT_ID:
@@ -72,7 +79,7 @@ def to_iran(dt):
 def fmt_iran(dt):
     return to_iran(dt).strftime("%H:%M")
 
-# ================== الگوهای کندلی ==================
+# ================== CANDLE PATTERNS ==================
 def bull_engulf(df, i):
     if i < 1: return 0
     p, c = df.iloc[i-1], df.iloc[i]
@@ -226,7 +233,7 @@ def purged_walk_forward(X, y, meta, expiry, n_folds):
 
 def backtest_symbol(name, symbol):
     try:
-        print(f"⏳ {name}...")
+        print(f"Loading {name}...")
         td = TDClient(apikey=TWELVE_DATA_API_KEY)
         ts = td.time_series(symbol=symbol, interval=INTERVAL, outputsize=OUTPUTSIZE, timezone="UTC")
         df = ts.as_pandas()
@@ -235,7 +242,7 @@ def backtest_symbol(name, symbol):
         df_h = ts_h.as_pandas()
         time.sleep(7)
         if df is None or df.empty or len(df) < 500:
-            return {"symbol": name, "error": "داده کم"}
+            return {"symbol": name, "error": "not enough data"}
         df = df.rename(columns=str.lower).sort_index()
         df_h = df_h.rename(columns=str.lower).sort_index()
         htf_feat = build_htf_features(df_h)
@@ -243,16 +250,16 @@ def backtest_symbol(name, symbol):
         df = merge_htf_ltf(df, htf_feat)
         df = df.dropna()
         if len(df) < 500:
-            return {"symbol": name, "error": "داده کم بعد فیلتر"}
-        
+            return {"symbol": name, "error": "not enough data after filter"}
+
         X, y, meta = create_dataset(df, EXPIRY_CANDLES)
         if len(X) < 400:
-            return {"symbol": name, "error": "نمونه کم"}
-        
+            return {"symbol": name, "error": "not enough samples"}
+
         oos_probs, oos_y, oos_meta, fold_info = purged_walk_forward(X, y, meta, EXPIRY_CANDLES, N_FOLDS)
         if len(oos_probs) < 50:
-            return {"symbol": name, "error": "OOS کم"}
-        
+            return {"symbol": name, "error": "not enough OOS"}
+
         bankroll = INITIAL_BANKROLL
         signals, wins = 0, 0
         for j, prob in enumerate(oos_probs):
@@ -268,17 +275,17 @@ def backtest_symbol(name, symbol):
                 bankroll += stake * PAYOUT
             else:
                 bankroll -= stake
-        
+
         wr = (wins / signals * 100) if signals > 0 else 0
         ret_pct = (bankroll - INITIAL_BANKROLL) / INITIAL_BANKROLL * 100
-        
+
         if len(oos_meta) >= 2:
             days = (oos_meta[-1]['time'] - oos_meta[0]['time']).days
             days = max(days, 1)
         else:
             days = 1
         sig_per_day = round(signals / days, 1)
-        
+
         final_model = RandomForestClassifier(
             n_estimators=200, max_depth=10,
             min_samples_split=20, min_samples_leaf=10,
@@ -286,7 +293,7 @@ def backtest_symbol(name, symbol):
         )
         final_model.fit(X, y)
         trained_models[name] = final_model
-        
+
         return {
             "symbol": name,
             "signals": signals,
@@ -309,46 +316,46 @@ def run_backtest_background():
     backtest_running = True
     try:
         send_telegram(
-            "🔬 <b>بک‌تست در حال اجرا</b>\n\n"
-            "🎯 ۴ جفت‌ارز منتخب\n"
-            "⏱ اکسپایر: ۳۰ دقیقه\n"
-            "🎯 آستانه: ۷۰٪\n\n"
-            "⏳ ۵-۸ دقیقه طول می‌کشه..."
+            "BACKTEST STARTED\n\n"
+            "4 pairs selected\n"
+            "Expiry: 30 min\n"
+            "Threshold: 70%\n\n"
+            "Takes 5-8 minutes..."
         )
-        
+
         results = []
         for name, sym in SYMBOLS.items():
             r = backtest_symbol(name, sym)
             if "error" in r:
-                send_telegram(f"❌ <b>{name}</b>: {r['error']}")
+                send_telegram(f"ERROR {name}: {r['error']}")
                 continue
             results.append(r)
-            
+
             msg = (
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"📌 <b>{r['symbol']}</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"🎯 <b>وین ریت:</b> {r['wr']}%\n"
-                f"📈 <b>سیگنال:</b> {r['signals']} (روزی ~{r['signals_per_day']})\n"
-                f"💰 <b>بانک:</b> 1000$ → {r['final_bankroll']}$\n"
-                f"📊 <b>سود:</b> {r['return_pct']}%\n"
-                f"📉 <b>فولدها:</b> {r['folds']}"
+                f"====================\n"
+                f"{r['symbol']}\n"
+                f"====================\n\n"
+                f"Win Rate: {r['wr']}%\n"
+                f"Signals: {r['signals']} (~{r['signals_per_day']}/day)\n"
+                f"Bank: $1000 -> ${r['final_bankroll']}\n"
+                f"Return: {r['return_pct']}%\n"
+                f"Folds: {r['folds']}"
             )
             send_telegram(msg)
-        
+
         if results:
             total_signals = sum(r['signals'] for r in results)
             total_wins = sum(r['wins'] for r in results)
             avg_wr = round(total_wins / total_signals * 100, 2) if total_signals > 0 else 0
             avg_ret = round(sum(r['return_pct'] for r in results) / len(results), 2)
-            
+
             final = (
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🏆 <b>خلاصه کل</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"📊 وین ریت میانگین: <b>{avg_wr}%</b>\n"
-                f"📈 مجموع سیگنال: {total_signals}\n"
-                f"💰 میانگین بازدهی: <b>+{avg_ret}%</b>"
+                f"====================\n"
+                f"SUMMARY\n"
+                f"====================\n\n"
+                f"Avg Win Rate: {avg_wr}%\n"
+                f"Total Signals: {total_signals}\n"
+                f"Avg Return: +{avg_ret}%"
             )
             send_telegram(final)
     finally:
@@ -363,49 +370,54 @@ def analyze_live(symbol):
             return None
         ts_h = td.time_series(symbol=symbol, interval=HTF_INTERVAL, outputsize=200, timezone="UTC")
         df_h = ts_h.as_pandas()
-        
+
         df = df.rename(columns=str.lower).sort_index()
         df_h = df_h.rename(columns=str.lower).sort_index()
-        
+
         htf_feat = build_htf_features(df_h)
         df = build_ltf_features(df)
         df = merge_htf_ltf(df, htf_feat)
         df = df.dropna()
-        
+
         if len(df) < 250:
             return None
-        
+
         last_row = df.iloc[-1]
         if last_row[FEATURE_COLS].isna().any():
             return None
-        
+
         model = trained_models.get(symbol)
         if model is None:
             return None
-        
+
         X = last_row[FEATURE_COLS].values.astype(float).reshape(1, -1)
         prob = model.predict_proba(X)[0]
         confidence = max(prob) * 100
-        
+
+        # زمان بسته شدن کندل (با timezone)
+        entry_time = df.index[-1]
+        if entry_time.tzinfo is None:
+            entry_time = entry_time.replace(tzinfo=timezone.utc)
+        entry_time = entry_time + timedelta(minutes=15)
+        expiry_time = entry_time + timedelta(minutes=30)
+
         # ================== ذخیره آخرین تحلیل ==================
         direction_tmp = "CALL" if prob[1] > prob[0] else "PUT"
         last_analysis[symbol] = {
             "confidence": round(float(confidence), 2),
             "direction": direction_tmp,
-            "time_utc": (df.index[-1] + timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M"),
-            "time_iran": fmt_iran(df.index[-1] + timedelta(minutes=15)),
+            "time_utc": entry_time.strftime("%Y-%m-%d %H:%M"),
+            "time_iran": fmt_iran(entry_time),
             "status": "signal" if confidence >= THRESHOLD else "rejected",
             "threshold": THRESHOLD,
         }
-        
+
         if confidence < THRESHOLD:
             return None
-        
+
         direction = "CALL" if prob[1] > prob[0] else "PUT"
         entry_price = float(last_row['close'])
-        entry_time = df.index[-1] + timedelta(minutes=15)
-        expiry_time = entry_time + timedelta(minutes=30)
-        
+
         return {
             "symbol": symbol,
             "direction": direction,
@@ -439,25 +451,31 @@ def check_signal_result(signal):
         df = ts.as_pandas()
         if df is None or df.empty:
             return None
-        
+
         df = df.rename(columns=str.lower).sort_index()
-        
+
+        # اطمینان از timezone
         expiry_time = signal['expiry_time']
+        if expiry_time.tzinfo is None:
+            expiry_time = expiry_time.replace(tzinfo=timezone.utc)
+        if df.index.tzinfo is None:
+            df.index = df.index.tz_localize(timezone.utc)
+
         valid_candles = df[df.index <= expiry_time]
         if valid_candles.empty:
             return None
-        
+
         exit_price = float(valid_candles.iloc[-1]['close'])
         entry_price = signal['entry_price']
-        
+
         if exit_price == entry_price:
             return {'result': 'TIE', 'exit_price': exit_price, 'is_win': None}
-        
+
         if signal['direction'] == 'CALL':
             is_win = exit_price > entry_price
         else:
             is_win = exit_price < entry_price
-        
+
         return {
             'result': 'WIN' if is_win else 'LOSS',
             'exit_price': exit_price,
@@ -470,74 +488,74 @@ def check_signal_result(signal):
 def send_signal_result(signal):
     """ارسال نتیجه سیگنال به تلگرام"""
     if signal['result'] == 'WIN':
-        title = "✅ <b>معامله برد</b>"
+        title = "TRADE WON"
     elif signal['result'] == 'LOSS':
-        title = "❌ <b>معامله باخت</b>"
+        title = "TRADE LOST"
     else:
-        title = "⚪ <b>معامله مساوی</b>"
-    
+        title = "TRADE TIE"
+
     msg = (
         f"{title}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 نماد: <b>{signal['symbol']}</b>\n"
-        f"🎯 جهت: <b>{signal['direction']}</b>\n"
-        f"🕐 ورود: {fmt_iran(signal['entry_time'])} ایران\n"
-        f"🔔 پایان: {fmt_iran(signal['expiry_time'])} ایران\n"
-        f"💵 ورود: {signal['entry_price']:.5f}\n"
-        f"💵 خروج: {signal['exit_price']:.5f}\n"
+        f"====================\n"
+        f"Symbol: {signal['symbol']}\n"
+        f"Direction: {signal['direction']}\n"
+        f"Entry: {fmt_iran(signal['entry_time'])} IRAN\n"
+        f"End: {fmt_iran(signal['expiry_time'])} IRAN\n"
+        f"Price In: {signal['entry_price']:.5f}\n"
+        f"Price Out: {signal['exit_price']:.5f}\n"
     )
-    
+
     total = len(completed_signals)
     wins = sum(1 for s in completed_signals if s.get('is_win') is True)
     losses = sum(1 for s in completed_signals if s.get('is_win') is False)
     ties = sum(1 for s in completed_signals if s.get('is_win') is None)
-    
+
     if total > 0:
         decided = wins + losses
         wr = round(wins / decided * 100, 1) if decided > 0 else 0
         msg += (
-            f"\n📈 <b>آمار کلی:</b>\n"
-            f"   کل: {total} | برد: {wins} | باخت: {losses}"
+            f"\nSTATS:\n"
+            f"Total: {total} | W: {wins} | L: {losses}"
         )
         if ties > 0:
-            msg += f" | مساوی: {ties}"
-        msg += f"\n   🎯 وین ریت: <b>{wr}%</b>"
-    
+            msg += f" | T: {ties}"
+        msg += f"\nWin Rate: {wr}%"
+
     send_telegram(msg)
 
 def result_checker_loop():
     """حلقه بررسی نتایج سیگنال‌ها"""
     global pending_signals, completed_signals
-    
+
     while True:
         try:
             now_utc = datetime.now(timezone.utc)
-            
+
             for signal in list(pending_signals):
                 check_time = signal['expiry_time'] + timedelta(minutes=1)
-                
+
                 if now_utc >= check_time:
-                    print(f"🔍 بررسی نتیجه {signal['symbol']} {signal['direction']}")
+                    print(f"Checking result {signal['symbol']} {signal['direction']}")
                     result = check_signal_result(signal)
-                    
+
                     if result is None:
                         continue
-                    
+
                     pending_signals.remove(signal)
                     signal['result'] = result['result']
                     signal['exit_price'] = result['exit_price']
                     signal['is_win'] = result['is_win']
                     completed_signals.append(signal)
-                    
+
                     send_signal_result(signal)
-                    print(f"📊 نتیجه: {signal['symbol']} → {signal['result']}")
-            
+                    print(f"Result: {signal['symbol']} -> {signal['result']}")
+
             time.sleep(30)
         except Exception as e:
             print(f"result_checker error: {e}")
             time.sleep(60)
 
-# ================== فیلتر ساعتی ==================
+# ================== SESSION FILTER ==================
 def is_active_session():
     """
     فقط در ساعات فعال بازار فارکس سیگنال بده.
@@ -545,127 +563,154 @@ def is_active_session():
     شنبه و یکشنبه بازار فارکس تعطیله
     """
     now_utc = datetime.now(timezone.utc)
-    weekday = now_utc.weekday()  # 0=دوشنبه, 5=شنبه, 6=یکشنبه
+    weekday = now_utc.weekday()  # 0=Monday, 5=Saturday, 6=Sunday
     hour = now_utc.hour
-    
+
     # شنبه و یکشنبه - بازار فارکس تعطیله
     if weekday >= 5:
         return False
-    
+
     # فقط ساعات باکیفیت
     return 8 <= hour < 21
+
+# ================== BIAS CHECK ==================
+def check_direction_bias(symbol, direction):
+    """
+    چک می‌کنه آیا جهت سیگنال با Bias مطابقت داره یا نه.
+    اگه بیش از MAX_SAME_DIRECTION_STREAK سیگنال هم‌جهت پشت سر هم داده، رد کن.
+    """
+    if symbol not in direction_streak:
+        direction_streak[symbol] = {"direction": direction, "count": 1}
+        return True
+
+    info = direction_streak[symbol]
+
+    if info["direction"] == direction:
+        if info["count"] >= MAX_SAME_DIRECTION_STREAK:
+            print(f"Bias blocked: {symbol} {direction} x{info['count']}")
+            return False
+        info["count"] += 1
+    else:
+        direction_streak[symbol] = {"direction": direction, "count": 1}
+
+    return True
 
 def live_loop():
     global live_running, signal_id_counter
     last_signal_time = {}
-    
+
     while live_running:
         try:
             now_utc = datetime.now(timezone.utc)
             minute = now_utc.minute
             second = now_utc.second
-            
+
             # چک ساعت فعال
             if not is_active_session():
                 time.sleep(60)
                 continue
-            
+
             if minute % 15 == 0 and 5 <= second <= 25:
                 slot_key = now_utc.strftime("%Y%m%d%H%M")
                 if slot_key == last_signal_time.get("_slot"):
                     time.sleep(5)
                     continue
                 last_signal_time["_slot"] = slot_key
-                
-                print(f"🔍 بررسی سیگنال‌ها در {to_iran(now_utc).strftime('%H:%M')} ایران")
-                
+
+                print(f"Scanning signals at {to_iran(now_utc).strftime('%H:%M')} Iran")
+
                 for name, sym in SYMBOLS.items():
                     try:
                         result = analyze_live(sym)
                         if result is None:
                             time.sleep(2)
                             continue
-                        
+
+                        # چک Bias
+                        if not check_direction_bias(result['symbol'], result['direction']):
+                            print(f"Skipped {result['symbol']} {result['direction']} due to bias")
+                            time.sleep(2)
+                            continue
+
                         sig_key = f"{result['symbol']}_{result['entry_time'].strftime('%Y%m%d%H%M')}"
                         if sig_key == last_signal_time.get(result['symbol']):
                             time.sleep(2)
                             continue
                         last_signal_time[result['symbol']] = sig_key
-                        
-                        emoji = "🟢" if result['direction'] == "CALL" else "🔴"
+
+                        emoji = "CALL" if result['direction'] == "CALL" else "PUT"
                         msg = (
-                            f"{emoji} <b>سیگنال {result['direction']}</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━\n"
-                            f"📊 نماد: <b>{result['symbol']}</b>\n"
-                            f"🕐 ورود: <b>{fmt_iran(result['entry_time'])}</b> ایران\n"
-                            f"⏱ اکسپایر: <b>۳۰ دقیقه</b>\n"
-                            f"🔔 پایان: <b>{fmt_iran(result['expiry_time'])}</b> ایران\n"
-                            f"💵 قیمت: {result['entry_price']:.5f}\n"
-                            f"🎯 اطمینان: <b>{result['confidence']}%</b>"
+                            f"SIGNAL {emoji}\n"
+                            f"====================\n"
+                            f"Symbol: {result['symbol']}\n"
+                            f"Entry: {fmt_iran(result['entry_time'])} IRAN\n"
+                            f"Expiry: 30 min\n"
+                            f"End: {fmt_iran(result['expiry_time'])} IRAN\n"
+                            f"Price: {result['entry_price']:.5f}\n"
+                            f"Confidence: {result['confidence']}%"
                         )
                         send_telegram(msg)
-                        print(f"✅ سیگنال: {result['symbol']} {result['direction']}")
-                        
-                        # ذخیره سیگنال برای بررسی نتیجه
+                        print(f"Signal: {result['symbol']} {result['direction']}")
+
                         signal_id_counter += 1
                         result['id'] = signal_id_counter
                         result['saved_at'] = now_utc
                         pending_signals.append(result)
-                        print(f"📌 سیگنال ذخیره شد برای بررسی نتیجه")
-                        
+                        print(f"Signal saved for result checking")
+
                     except Exception as e:
                         print(f"error {name}: {e}")
                     time.sleep(2)
-            
+
             time.sleep(5)
         except Exception as e:
             print(f"live_loop error: {e}")
             time.sleep(10)
 
-# ================== راه‌اندازی خودکار ==================
+# ================== AUTO START ==================
 def auto_start():
-    """خودکار راه‌اندازی: اگه مدل نیست، بک‌تست بزن، بعد live رو فعال کن"""
     global live_running, auto_start_done
-    
+
     time.sleep(15)
-    
+
     print("=" * 50)
-    print("🤖 راه‌اندازی خودکار شروع شد")
+    print("AUTO START")
     print("=" * 50)
-    
+
     try:
-        send_telegram("🤖 <b>راه‌اندازی خودکار</b>\n\nدر حال آماده‌سازی ربات...")
-        
+        send_telegram("AUTO START\n\nPreparing bot...")
+
         if not trained_models:
-            print("📚 مدل‌ها وجود ندارن. شروع بک‌تست...")
+            print("No models. Starting backtest...")
             run_backtest_background()
-            
+
             while backtest_running:
                 time.sleep(5)
-            
-            print(f"✅ بک‌تست تموم شد. {len(trained_models)} مدل آموزش دید.")
-        
+
+            print(f"Backtest done. {len(trained_models)} models trained.")
+
         if trained_models and not live_running:
             live_running = True
             threading.Thread(target=live_loop, daemon=True).start()
             threading.Thread(target=result_checker_loop, daemon=True).start()
-            print("🟢 حالت سیگنال زنده فعال شد.")
-            print("📊 چکر نتایج هم فعال شد.")
+            print("Live mode activated.")
+            print("Result checker activated.")
             send_telegram(
-                "🟢 <b>ربات آماده است!</b>\n\n"
-                f"🎯 {len(trained_models)} مدل آموزش‌دیده\n"
-                f"⏱ اکسپایر: ۳۰ دقیقه\n"
-                f"🎯 آستانه: {THRESHOLD}%\n\n"
-                "از این به بعد، سیگنال‌ها خودکار ارسال می‌شن.\n"
-                "نتیجه هر سیگنال هم ۳۱ دقیقه بعد گزارش می‌شه. 📊\n\n"
-                "موفق باشی! 🚀"
+                "BOT READY!\n\n"
+                f"{len(trained_models)} models trained\n"
+                f"Expiry: 30 min\n"
+                f"Threshold: {THRESHOLD}%\n"
+                f"Max same-direction streak: {MAX_SAME_DIRECTION_STREAK}\n\n"
+                "Signals will be sent automatically.\n"
+                "Result of each signal reported 31 min later.\n\n"
+                "Good luck!"
             )
         auto_start_done = True
     except Exception as e:
         print(f"auto_start error: {e}")
         import traceback
         traceback.print_exc()
-        send_telegram(f"❌ خطا در راه‌اندازی خودکار: {e}")
+        send_telegram(f"Auto start error: {e}")
 
 @app.route('/')
 def health():
@@ -674,7 +719,7 @@ def health():
 @app.route('/backtest', methods=['GET'])
 def backtest_route():
     threading.Thread(target=run_backtest_background, daemon=True).start()
-    return jsonify({"status": "ok", "message": "بک‌تست شروع شد"}), 200
+    return jsonify({"status": "ok", "message": "Backtest started"}), 200
 
 @app.route('/start_live', methods=['GET'])
 def start_live_route():
@@ -682,18 +727,18 @@ def start_live_route():
     if live_running:
         return jsonify({"status": "already_running"}), 200
     if not trained_models:
-        return jsonify({"status": "error", "message": "مدل آموزش ندیده. صبر کن یا /backtest بزن"}), 400
+        return jsonify({"status": "error", "message": "No models trained yet"}), 400
     live_running = True
     threading.Thread(target=live_loop, daemon=True).start()
     threading.Thread(target=result_checker_loop, daemon=True).start()
-    send_telegram("🟢 حالت سیگنال زنده فعال شد.")
+    send_telegram("Live mode activated.")
     return jsonify({"status": "started"}), 200
 
 @app.route('/stop_live', methods=['GET'])
 def stop_live_route():
     global live_running
     live_running = False
-    send_telegram("🔴 حالت سیگنال زنده متوقف شد.")
+    send_telegram("Live mode stopped.")
     return jsonify({"status": "stopped"}), 200
 
 @app.route('/status', methods=['GET'])
@@ -705,11 +750,11 @@ def status_route():
         "auto_start_done": auto_start_done,
         "pending": len(pending_signals),
         "completed": len(completed_signals),
+        "direction_streak": direction_streak,
     }), 200
 
 @app.route('/analysis', methods=['GET'])
 def analysis_route():
-    """آخرین تحلیل هر جفت‌ارز"""
     now_utc = datetime.now(timezone.utc)
     result = {
         "current_time_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
@@ -718,7 +763,7 @@ def analysis_route():
         "threshold": THRESHOLD,
         "symbols": {}
     }
-    
+
     for name, sym in SYMBOLS.items():
         if sym in last_analysis:
             info = last_analysis[sym].copy()
@@ -728,9 +773,9 @@ def analysis_route():
             result["symbols"][name] = {
                 "name": name,
                 "status": "not_analyzed_yet",
-                "message": "هنوز تحلیل نشده"
+                "message": "not analyzed yet"
             }
-    
+
     return jsonify(result), 200
 
 @app.route('/stats', methods=['GET'])
