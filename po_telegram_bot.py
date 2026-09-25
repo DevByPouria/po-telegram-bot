@@ -539,9 +539,21 @@ def result_checker_loop():
 
 # ================== فیلتر ساعتی ==================
 def is_active_session():
-    """فقط ۸:۰۰ تا ۲۱:۰۰ UTC = ۱۱:۳۰ تا ۰۰:۳۰ ایران"""
+    """
+    فقط در ساعات فعال بازار فارکس سیگنال بده.
+    دوشنبه تا جمعه، ۸:۰۰ تا ۲۱:۰۰ UTC
+    شنبه و یکشنبه بازار فارکس تعطیله
+    """
     now_utc = datetime.now(timezone.utc)
-    return 8 <= now_utc.hour < 21
+    weekday = now_utc.weekday()  # 0=دوشنبه, 5=شنبه, 6=یکشنبه
+    hour = now_utc.hour
+    
+    # شنبه و یکشنبه - بازار فارکس تعطیله
+    if weekday >= 5:
+        return False
+    
+    # فقط ساعات باکیفیت
+    return 8 <= hour < 21
 
 def live_loop():
     global live_running, signal_id_counter
