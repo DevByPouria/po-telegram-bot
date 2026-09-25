@@ -62,6 +62,7 @@ last_analysis = {}
 # {symbol: {"direction": "PUT", "count": 3}}
 direction_streak = {}
 
+
 def send_telegram(message):
     if not BOT_TOKEN or not CHAT_ID:
         return
@@ -596,6 +597,109 @@ def check_direction_bias(symbol, direction):
     warn = info["count"] >= WARN_SAME_DIRECTION_STREAK
     return {"streak": info["count"], "warn": warn}
 
+def send_daily_summary():
+    """محاسبه و ارسال خلاصه روز"""
+    now_iran = to_iran(datetime.now(timezone.utc))
+    today_start = now_iran.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    # فیلتر سیگنال‌های امروز
+    today_signals = []
+    for s in completed_signals:
+        try:
+            entry_iran = to_iran(s['entry_time'])
+            if entry_iran >= today_start:
+                today_signals.append(s)
+        except:
+            continue
+    
+    if not today_signals:
+        send_telegram(
+            "خلاصه روز\n"
+            "====================\n\n"
+            f"تاریخ: {now_iran.strftime('%Y-%m-%d')}\n\n"
+            "امروز هیچ سیگنالی صادر نشد"
+        )
+        return
+    
+    # آمار کلی
+    total = len(today_signals)
+    wins = sum(1 for s in today_signals if s.get('is_win') is True)
+    losses = sum(1 for s in today_signals if s.get('is_win') is False)
+    ties = sum(1 for s in today_signals if s.get('is_win') is None)
+    decided = wins + losses
+    wr = round(wins / decided * 100, 1) if decided > 0 else 0
+    
+    # آمار به تفکیک جفت‌ارز
+    pair_stats = {}
+    for s in today_signals:
+        sym = s['symbol']
+        if sym not in pair_stats:
+            pair_stats[sym] = {'total': 0, 'wins': 0, 'losses': 0}
+        pair_stats[sym]['total'] += 1
+        if s.get('is_win') is True:
+            pair_stats[sym]['wins'] += 1
+        elif s.get('is_win') is False:
+            pair_stats[sym]['losses'] += 1
+    
+    # ساخت پیام
+    msg = "خلاصه روز\n"
+    msg += "====================\n"
+    msg += f"تاریخ: {now_iran.strftime('%Y-%m-%d')}\n\n"
+    msg += f"کل سیگنال: {total}\n"
+    msg += f"برد: {wins} | باخت: {losses}"
+    if ties > 0:
+        msg += f" | مساوی: {ties}"
+    msg += f"\nوین ریت: {wr}%\n\n"
+    
+    msg += "به تفکیک جفت ارز:\n"
+    best_pair = None
+    best_wr = 0
+    worst_pair = None
+    worst_wr = 100
+    
+    for sym, stats in pair_stats.items():
+        d = stats['wins'] + stats['losses']
+        pair_wr = round(stats['wins'] / d * 100, 1) if d > 0 else 0
+        msg += f"  {sym}: {stats['total']} سیگنال ({pair_wr}%)\n"
+        
+        if stats['total'] >= 3:
+            if pair_wr > best_wr:
+                best_wr = pair_wr
+                best_pair = sym
+            if pair_wr < worst_wr:
+                worst_wr = pair_wr
+                worst_pair = sym
+    
+    if best_pair:
+        msg += f"\nبهترین: {best_pair} ({best_wr}%)"
+    if worst_pair and worst_pair != best_pair:
+        msg += f"\nضعیف ترین: {worst_pair} ({worst_wr}%)"
+    
+    send_telegram(msg)
+
+
+def daily_summary_loop():
+    """حلقه ارسال خلاصه پایان روز - ساعت 00:30 ایران"""
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            iran_time = to_iran(now_utc)
+            
+            # چک ساعت 00:30 ایران
+            if iran_time.hour == 0 and iran_time.minute == 30:
+                today_key = iran_time.strftime("%Y-%m-%d")
+                
+                if today_key not in daily_summary_sent:
+                    daily_summary_sent[today_key] = True
+                    print(f"Sending daily summary for {today_key}")
+                    send_daily_summary()
+            
+            time.sleep(60)
+        except Exception as e:
+            print(f"daily_summary error: {e}")
+            time.sleep(60)
+
+
 def live_loop():
     global live_running, signal_id_counter
     last_signal_time = {}
@@ -695,6 +799,7 @@ def auto_start():
             live_running = True
             threading.Thread(target=live_loop, daemon=True).start()
             threading.Thread(target=result_checker_loop, daemon=True).start()
+            threading.Thread(target=daily_summary_loop, daemon=True).start()
             print("Live mode activated.")
             print("Result checker activated.")
             send_telegram(
@@ -733,6 +838,7 @@ def start_live_route():
     live_running = True
     threading.Thread(target=live_loop, daemon=True).start()
     threading.Thread(target=result_checker_loop, daemon=True).start()
+    threading.Thread(target=daily_summary_loop, daemon=True).start()
     send_telegram("Live mode activated.")
     return jsonify({"status": "started"}), 200
 
