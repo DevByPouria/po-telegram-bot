@@ -778,6 +778,16 @@ def analysis_route():
             }
 
     return jsonify(result), 200
+    
+@app.route('/test_features', methods=['GET'])
+def test_features_route():
+    import subprocess
+    import sys
+    subprocess.Popen([sys.executable, "feature_test.py"])
+    send_telegram("تست فیچرها شروع شد. نتایج تا 15-20 دقیقه دیگه میاد.")
+    return jsonify({"status": "ok", "message": "Feature test started"}), 200
+
+@app.route('/stats', methods=['GET'])
 
 @app.route('/stats', methods=['GET'])
 def stats_route():
