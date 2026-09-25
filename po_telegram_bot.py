@@ -368,6 +368,7 @@ def analyze_live(symbol):
         df = ts.as_pandas()
         if df is None or df.empty or len(df) < 250:
             return None
+        time.sleep(8)
         ts_h = td.time_series(symbol=symbol, interval=HTF_INTERVAL, outputsize=200, timezone="UTC")
         df_h = ts_h.as_pandas()
 
