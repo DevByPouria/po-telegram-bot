@@ -40,7 +40,7 @@ PAYOUT = 0.85
 STAKE_PCT = 0.01
 
 # حداکثر سیگنال هم‌جهت پشت سر هم (برای جلوگیری از Bias)
-MAX_SAME_DIRECTION_STREAK = 3
+MAX_SAME_DIRECTION_STREAK = 5
 
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
@@ -576,24 +576,24 @@ def is_active_session():
 # ================== BIAS CHECK ==================
 def check_direction_bias(symbol, direction):
     """
-    چک می‌کنه آیا جهت سیگنال با Bias مطابقت داره یا نه.
-    اگه بیش از MAX_SAME_DIRECTION_STREAK سیگنال هم‌جهت پشت سر هم داده، رد کن.
+    چک می‌کنه چند سیگنال هم‌جهت پشت سر هم داده شده.
+    فقط برای هشدار - سیگنال رو رد نمی‌کنه.
     """
     if symbol not in direction_streak:
         direction_streak[symbol] = {"direction": direction, "count": 1}
-        return True
+        return {"streak": 1, "warn": False}
 
     info = direction_streak[symbol]
 
     if info["direction"] == direction:
-        if info["count"] >= MAX_SAME_DIRECTION_STREAK:
-            print(f"Bias blocked: {symbol} {direction} x{info['count']}")
-            return False
         info["count"] += 1
     else:
         direction_streak[symbol] = {"direction": direction, "count": 1}
+        info = direction_streak[symbol]
 
-    return True
+    # هشدار اگه به آستانه رسید
+    warn = info["count"] >= WARN_SAME_DIRECTION_STREAK
+    return {"streak": info["count"], "warn": warn}
 
 def live_loop():
     global live_running, signal_id_counter
@@ -626,11 +626,8 @@ def live_loop():
                             time.sleep(2)
                             continue
 
-                        # چک Bias
-                        if not check_direction_bias(result['symbol'], result['direction']):
-                            print(f"Skipped {result['symbol']} {result['direction']} due to bias")
-                            time.sleep(2)
-                            continue
+                        # چک Bias (فقط برای هشدار - سیگنال رو رد نمی‌کنه)
+                        bias_info = check_direction_bias(result['symbol'], result['direction'])
 
                         sig_key = f"{result['symbol']}_{result['entry_time'].strftime('%Y%m%d%H%M')}"
                         if sig_key == last_signal_time.get(result['symbol']):
@@ -649,6 +646,10 @@ def live_loop():
                             f"Price: {result['entry_price']:.5f}\n"
                             f"Confidence: {result['confidence']}%"
                         )
+
+                        # اضافه کردن هشدار اگه 5+ سیگنال هم‌جهت پشت سر هم
+                        if bias_info['warn']:
+                            msg += f"\n\nWARNING: {bias_info['streak']} same-direction signals in a row"
                         send_telegram(msg)
                         print(f"Signal: {result['symbol']} {result['direction']}")
 
