@@ -1,5 +1,6 @@
 import os
 import gc
+import json
 import time
 import threading
 import requests
@@ -39,7 +40,7 @@ INITIAL_BANKROLL = 1000.0
 PAYOUT = 0.85
 STAKE_PCT = 0.01
 
-# حداکثر سیگنال هم‌جهت پشت سر هم (برای جلوگیری از Bias)
+# حداکثر سیگنال هم‌جهت پشت سر هم (برای هشدار)
 MAX_SAME_DIRECTION_STREAK = 5
 
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
@@ -59,26 +60,346 @@ signal_id_counter = 0
 last_analysis = {}
 
 # ================== BIAS TRACKING ==================
-# {symbol: {"direction": "PUT", "count": 3}}
 direction_streak = {}
 
+# ================== DAILY SUMMARY ==================
+daily_summary_sent = {}
 
-def send_telegram(message):
+# ================== TELEGRAM POLLING ==================
+last_update_id = 0
+
+# ================== SIGNALS FILE ==================
+SIGNALS_FILE = "signals_data.json"
+
+
+def send_telegram(message, reply_markup=None):
     if not BOT_TOKEN or not CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
     try:
-        requests.post(url, json={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=15)
+        requests.post(url, json=payload, timeout=15)
     except Exception as e:
         print(f"telegram error: {e}")
+
+
+def get_main_keyboard():
+    """کیبورد اصلی با دکمه ها"""
+    keyboard = {
+        "keyboard": [
+            [{"text": "آمار"}, {"text": "وضعیت"}],
+            [{"text": "تحلیل"}, {"text": "امروز"}],
+            [{"text": "خلاصه روز"}, {"text": "راهنما"}],
+            [{"text": "توقف"}, {"text": "شروع"}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+    return keyboard
+
+
+def send_telegram_with_keyboard(message):
+    """ارسال پیام با کیبورد"""
+    send_telegram(message, reply_markup=get_main_keyboard())
+
 
 def to_iran(dt):
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(IRAN_TZ)
 
+
 def fmt_iran(dt):
     return to_iran(dt).strftime("%H:%M")
+
+
+# ================== SAVE / LOAD SIGNALS ==================
+def _serialize_signal(s):
+    """تبدیل سیگنال به فرمت قابل ذخیره"""
+    s_copy = s.copy()
+    for key in ['entry_time', 'expiry_time', 'saved_at']:
+        if key in s_copy and hasattr(s_copy[key], 'isoformat'):
+            s_copy[key] = s_copy[key].isoformat()
+    return s_copy
+
+
+def _deserialize_signal(s):
+    """تبدیل سیگنال از فرمت ذخیره شده"""
+    for key in ['entry_time', 'expiry_time', 'saved_at']:
+        if key in s and isinstance(s[key], str):
+            try:
+                s[key] = datetime.fromisoformat(s[key])
+            except:
+                pass
+    return s
+
+
+def save_signals():
+    """ذخیره سیگنال ها توی فایل"""
+    try:
+        pending_serialized = [_serialize_signal(s) for s in pending_signals]
+        completed_serialized = [_serialize_signal(s) for s in completed_signals]
+
+        data = {
+            "pending": pending_serialized,
+            "completed": completed_serialized,
+            "signal_counter": signal_id_counter,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        with open(SIGNALS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print(f"Signals saved: {len(pending_serialized)} pending, {len(completed_serialized)} completed")
+    except Exception as e:
+        print(f"save_signals error: {e}")
+
+
+def load_signals():
+    """بازیابی سیگنال ها از فایل"""
+    global pending_signals, completed_signals, signal_id_counter
+    try:
+        if not os.path.exists(SIGNALS_FILE):
+            print("No signals file found. Starting fresh.")
+            return
+
+        with open(SIGNALS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        pending_signals = [_deserialize_signal(s) for s in data.get("pending", [])]
+        completed_signals = [_deserialize_signal(s) for s in data.get("completed", [])]
+        signal_id_counter = data.get("signal_counter", 0)
+
+        print(f"Signals loaded: {len(pending_signals)} pending, {len(completed_signals)} completed")
+    except Exception as e:
+        print(f"load_signals error: {e}")
+
+
+# ================== TELEGRAM COMMANDS ==================
+def send_help_command():
+    msg = (
+        "دستورات موجود\n"
+        "====================\n\n"
+        "از دکمه های پایین صفحه استفاده کن\n"
+        "یا این دستورات رو بزن:\n\n"
+        "/stats - آمار کلی\n"
+        "/status - وضعیت ربات\n"
+        "/analysis - آخرین تحلیل\n"
+        "/today - آمار امروز\n"
+        "/daily - خلاصه امروز\n"
+        "/pause - توقف موقت\n"
+        "/resume - شروع مجدد\n"
+        "/help - این راهنما"
+    )
+    send_telegram_with_keyboard(msg)
+
+
+def send_stats_command():
+    total = len(completed_signals)
+    wins = sum(1 for s in completed_signals if s.get('is_win') is True)
+    losses = sum(1 for s in completed_signals if s.get('is_win') is False)
+    ties = sum(1 for s in completed_signals if s.get('is_win') is None)
+    decided = wins + losses
+    wr = round(wins / decided * 100, 1) if decided > 0 else 0
+
+    msg = "آمار کلی\n"
+    msg += "====================\n\n"
+    msg += f"کل سیگنال: {total}\n"
+    msg += f"برد: {wins} | باخت: {losses}"
+    if ties > 0:
+        msg += f" | مساوی: {ties}"
+    msg += f"\nوین ریت: {wr}%\n"
+    msg += f"در انتظار: {len(pending_signals)}\n\n"
+
+    if completed_signals:
+        msg += "آخرین 5 سیگنال:\n"
+        for s in completed_signals[-5:]:
+            if s.get('is_win') is True:
+                emoji = "برد"
+            elif s.get('is_win') is False:
+                emoji = "باخت"
+            else:
+                emoji = "مساوی"
+            msg += f"  {s['symbol']} {s['direction']} - {emoji}\n"
+
+    send_telegram_with_keyboard(msg)
+
+
+def send_status_command():
+    msg = "وضعیت ربات\n"
+    msg += "====================\n\n"
+    msg += f"مدل ها: {len(trained_models)}\n"
+    msg += f"Live: {'فعال' if live_running else 'غیرفعال'}\n"
+    msg += f"Backtest: {'در حال اجرا' if backtest_running else 'متوقف'}\n"
+    msg += f"در انتظار: {len(pending_signals)}\n"
+    msg += f"تکمیل شده: {len(completed_signals)}\n\n"
+
+    if trained_models:
+        msg += "جفت ارزهای آموزش دیده:\n"
+        for name in trained_models.keys():
+            msg += f"  {name}\n"
+
+    send_telegram_with_keyboard(msg)
+
+
+def send_analysis_command():
+    msg = "آخرین تحلیل\n"
+    msg += "====================\n\n"
+
+    if not last_analysis:
+        msg += "هنوز تحلیلی انجام نشده."
+    else:
+        for sym, info in last_analysis.items():
+            conf = info.get('confidence', 0)
+            direction = info.get('direction', '?')
+            status = info.get('status', '?')
+            time_ir = info.get('time_iran', '?')
+
+            if status == 'signal':
+                status_fa = 'سیگنال'
+            elif status == 'rejected':
+                status_fa = 'رد شده'
+            else:
+                status_fa = 'خطا'
+
+            msg += f"{sym}\n"
+            msg += f"  اطمینان: {conf}%\n"
+            msg += f"  جهت: {direction}\n"
+            msg += f"  وضعیت: {status_fa}\n"
+            msg += f"  زمان: {time_ir}\n\n"
+
+    msg += f"آستانه: {THRESHOLD}%"
+    send_telegram_with_keyboard(msg)
+
+
+def send_today_command():
+    now_iran = to_iran(datetime.now(timezone.utc))
+    today_start = now_iran.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    today_signals = []
+    for s in completed_signals:
+        try:
+            entry_iran = to_iran(s['entry_time'])
+            if entry_iran >= today_start:
+                today_signals.append(s)
+        except:
+            continue
+
+    if not today_signals:
+        send_telegram_with_keyboard("امروز هنوز سیگنالی تکمیل نشده.")
+        return
+
+    total = len(today_signals)
+    wins = sum(1 for s in today_signals if s.get('is_win') is True)
+    losses = sum(1 for s in today_signals if s.get('is_win') is False)
+    decided = wins + losses
+    wr = round(wins / decided * 100, 1) if decided > 0 else 0
+
+    msg = f"آمار امروز ({now_iran.strftime('%Y-%m-%d')})\n"
+    msg += "====================\n\n"
+    msg += f"کل: {total}\n"
+    msg += f"برد: {wins} | باخت: {losses}\n"
+    msg += f"وین ریت: {wr}%\n\n"
+
+    pair_stats = {}
+    for s in today_signals:
+        sym = s['symbol']
+        if sym not in pair_stats:
+            pair_stats[sym] = {'total': 0, 'wins': 0, 'losses': 0}
+        pair_stats[sym]['total'] += 1
+        if s.get('is_win') is True:
+            pair_stats[sym]['wins'] += 1
+        elif s.get('is_win') is False:
+            pair_stats[sym]['losses'] += 1
+
+    msg += "به تفکیک:\n"
+    for sym, stats in pair_stats.items():
+        d = stats['wins'] + stats['losses']
+        pwr = round(stats['wins'] / d * 100, 1) if d > 0 else 0
+        msg += f"  {sym}: {stats['total']} ({pwr}%)\n"
+
+    send_telegram_with_keyboard(msg)
+
+
+def handle_command(update):
+    """پردازش دستورات تلگرام (چه از دکمه چه از متن)"""
+    global live_running
+    try:
+        msg = update.get("message") or update.get("edited_message")
+        if not msg:
+            return
+
+        chat_id = msg.get("chat", {}).get("id")
+        text = (msg.get("text") or "").strip()
+
+        # چک کن از چت خودمونه
+        if str(chat_id) != str(CHAT_ID):
+            return
+
+        if not text:
+            return
+
+        # نرمال کردن: دستور یا متن دکمه
+        cmd = text.split()[0].lower()
+        if cmd.startswith("/"):
+            cmd = cmd.split("@")[0]
+
+        # دکمه های کیبورد
+        if text == "آمار" or cmd == "/stats":
+            send_stats_command()
+        elif text == "وضعیت" or cmd == "/status":
+            send_status_command()
+        elif text == "تحلیل" or cmd == "/analysis":
+            send_analysis_command()
+        elif text == "امروز" or cmd == "/today":
+            send_today_command()
+        elif text == "خلاصه روز" or cmd == "/daily":
+            send_daily_summary()
+        elif text == "راهنما" or cmd == "/help":
+            send_help_command()
+        elif text == "توقف" or cmd == "/pause" or cmd == "/stop":
+            if live_running:
+                live_running = False
+                send_telegram_with_keyboard("ربات موقتا متوقف شد. برای شروع مجدد دکمه شروع رو بزن.")
+            else:
+                send_telegram_with_keyboard("ربات از قبل متوقف بود.")
+        elif text == "شروع" or cmd == "/resume" or cmd == "/start":
+            if not trained_models:
+                send_telegram_with_keyboard("مدل ها آموزش ندیدن. صبر کن.")
+            elif live_running:
+                send_telegram_with_keyboard("ربات در حال حاضر فعاله.")
+            else:
+                live_running = True
+                threading.Thread(target=live_loop, daemon=True).start()
+                send_telegram_with_keyboard("ربات دوباره فعال شد.")
+        else:
+            send_telegram_with_keyboard(f"دستور ناشناخته: {text}\n\nبرای راهنما دکمه راهنما رو بزن.")
+    except Exception as e:
+        print(f"handle_command error: {e}")
+
+
+def poll_telegram_commands():
+    """حلقه دریافت دستورات تلگرام"""
+    global last_update_id
+
+    time.sleep(30)
+
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+            params = {"offset": last_update_id + 1, "timeout": 30}
+            response = requests.get(url, params=params, timeout=40)
+            data = response.json()
+
+            if data.get("ok"):
+                for update in data.get("result", []):
+                    last_update_id = update["update_id"]
+                    handle_command(update)
+        except Exception as e:
+            print(f"poll error: {e}")
+            time.sleep(10)
+
 
 # ================== CANDLE PATTERNS ==================
 def bull_engulf(df, i):
@@ -320,7 +641,7 @@ def run_backtest_background():
             "BACKTEST STARTED\n\n"
             "4 pairs selected\n"
             "Expiry: 30 min\n"
-            "Threshold: 70%\n\n"
+            f"Threshold: {THRESHOLD}%\n\n"
             "Takes 5-8 minutes..."
         )
 
@@ -396,14 +717,12 @@ def analyze_live(symbol):
         prob = model.predict_proba(X)[0]
         confidence = max(prob) * 100
 
-        # زمان بسته شدن کندل (با timezone)
         entry_time = df.index[-1]
         if entry_time.tzinfo is None:
             entry_time = entry_time.replace(tzinfo=timezone.utc)
         entry_time = entry_time + timedelta(minutes=15)
         expiry_time = entry_time + timedelta(minutes=30)
 
-        # ================== ذخیره آخرین تحلیل ==================
         direction_tmp = "CALL" if prob[1] > prob[0] else "PUT"
         last_analysis[symbol] = {
             "confidence": round(float(confidence), 2),
@@ -441,7 +760,6 @@ def analyze_live(symbol):
         return None
 
 def check_signal_result(signal):
-    """بررسی نتیجه یک سیگنال بعد از اکسپایر"""
     try:
         td = TDClient(apikey=TWELVE_DATA_API_KEY)
         ts = td.time_series(
@@ -456,7 +774,6 @@ def check_signal_result(signal):
 
         df = df.rename(columns=str.lower).sort_index()
 
-        # اطمینان از timezone
         expiry_time = signal['expiry_time']
         if expiry_time.tzinfo is None:
             expiry_time = expiry_time.replace(tzinfo=timezone.utc)
@@ -488,7 +805,6 @@ def check_signal_result(signal):
         return None
 
 def send_signal_result(signal):
-    """ارسال نتیجه سیگنال به تلگرام"""
     if signal['result'] == 'WIN':
         title = "TRADE WON"
     elif signal['result'] == 'LOSS':
@@ -523,10 +839,9 @@ def send_signal_result(signal):
             msg += f" | T: {ties}"
         msg += f"\nWin Rate: {wr}%"
 
-    send_telegram(msg)
+    send_telegram_with_keyboard(msg)
 
 def result_checker_loop():
-    """حلقه بررسی نتایج سیگنال‌ها"""
     global pending_signals, completed_signals
 
     while True:
@@ -552,35 +867,28 @@ def result_checker_loop():
                     send_signal_result(signal)
                     print(f"Result: {signal['symbol']} -> {signal['result']}")
 
+                    save_signals()
+
             time.sleep(30)
         except Exception as e:
             print(f"result_checker error: {e}")
             time.sleep(60)
 
+
 # ================== SESSION FILTER ==================
 def is_active_session():
-    """
-    فقط در ساعات فعال بازار فارکس سیگنال بده.
-    دوشنبه تا جمعه، ۸:۰۰ تا ۲۱:۰۰ UTC
-    شنبه و یکشنبه بازار فارکس تعطیله
-    """
     now_utc = datetime.now(timezone.utc)
-    weekday = now_utc.weekday()  # 0=Monday, 5=Saturday, 6=Sunday
+    weekday = now_utc.weekday()
     hour = now_utc.hour
 
-    # شنبه و یکشنبه - بازار فارکس تعطیله
     if weekday >= 5:
         return False
 
-    # فقط ساعات باکیفیت
     return 8 <= hour < 21
+
 
 # ================== BIAS CHECK ==================
 def check_direction_bias(symbol, direction):
-    """
-    چک می‌کنه چند سیگنال هم‌جهت پشت سر هم داده شده.
-    فقط برای هشدار - سیگنال رو رد نمی‌کنه.
-    """
     if symbol not in direction_streak:
         direction_streak[symbol] = {"direction": direction, "count": 1}
         return {"streak": 1, "warn": False}
@@ -593,16 +901,14 @@ def check_direction_bias(symbol, direction):
         direction_streak[symbol] = {"direction": direction, "count": 1}
         info = direction_streak[symbol]
 
-    # هشدار اگه به آستانه رسید
-    warn = info["count"] >= WARN_SAME_DIRECTION_STREAK
+    warn = info["count"] >= MAX_SAME_DIRECTION_STREAK
     return {"streak": info["count"], "warn": warn}
 
+
 def send_daily_summary():
-    """محاسبه و ارسال خلاصه روز"""
     now_iran = to_iran(datetime.now(timezone.utc))
     today_start = now_iran.replace(hour=0, minute=0, second=0, microsecond=0)
-    
-    # فیلتر سیگنال‌های امروز
+
     today_signals = []
     for s in completed_signals:
         try:
@@ -611,25 +917,23 @@ def send_daily_summary():
                 today_signals.append(s)
         except:
             continue
-    
+
     if not today_signals:
-        send_telegram(
+        send_telegram_with_keyboard(
             "خلاصه روز\n"
             "====================\n\n"
             f"تاریخ: {now_iran.strftime('%Y-%m-%d')}\n\n"
             "امروز هیچ سیگنالی صادر نشد"
         )
         return
-    
-    # آمار کلی
+
     total = len(today_signals)
     wins = sum(1 for s in today_signals if s.get('is_win') is True)
     losses = sum(1 for s in today_signals if s.get('is_win') is False)
     ties = sum(1 for s in today_signals if s.get('is_win') is None)
     decided = wins + losses
     wr = round(wins / decided * 100, 1) if decided > 0 else 0
-    
-    # آمار به تفکیک جفت‌ارز
+
     pair_stats = {}
     for s in today_signals:
         sym = s['symbol']
@@ -640,8 +944,7 @@ def send_daily_summary():
             pair_stats[sym]['wins'] += 1
         elif s.get('is_win') is False:
             pair_stats[sym]['losses'] += 1
-    
-    # ساخت پیام
+
     msg = "خلاصه روز\n"
     msg += "====================\n"
     msg += f"تاریخ: {now_iran.strftime('%Y-%m-%d')}\n\n"
@@ -650,18 +953,18 @@ def send_daily_summary():
     if ties > 0:
         msg += f" | مساوی: {ties}"
     msg += f"\nوین ریت: {wr}%\n\n"
-    
+
     msg += "به تفکیک جفت ارز:\n"
     best_pair = None
     best_wr = 0
     worst_pair = None
     worst_wr = 100
-    
+
     for sym, stats in pair_stats.items():
         d = stats['wins'] + stats['losses']
         pair_wr = round(stats['wins'] / d * 100, 1) if d > 0 else 0
         msg += f"  {sym}: {stats['total']} سیگنال ({pair_wr}%)\n"
-        
+
         if stats['total'] >= 3:
             if pair_wr > best_wr:
                 best_wr = pair_wr
@@ -669,31 +972,29 @@ def send_daily_summary():
             if pair_wr < worst_wr:
                 worst_wr = pair_wr
                 worst_pair = sym
-    
+
     if best_pair:
         msg += f"\nبهترین: {best_pair} ({best_wr}%)"
     if worst_pair and worst_pair != best_pair:
         msg += f"\nضعیف ترین: {worst_pair} ({worst_wr}%)"
-    
-    send_telegram(msg)
+
+    send_telegram_with_keyboard(msg)
 
 
 def daily_summary_loop():
-    """حلقه ارسال خلاصه پایان روز - ساعت 00:30 ایران"""
     while True:
         try:
             now_utc = datetime.now(timezone.utc)
             iran_time = to_iran(now_utc)
-            
-            # چک ساعت 00:30 ایران
+
             if iran_time.hour == 0 and iran_time.minute == 30:
                 today_key = iran_time.strftime("%Y-%m-%d")
-                
+
                 if today_key not in daily_summary_sent:
                     daily_summary_sent[today_key] = True
                     print(f"Sending daily summary for {today_key}")
                     send_daily_summary()
-            
+
             time.sleep(60)
         except Exception as e:
             print(f"daily_summary error: {e}")
@@ -710,7 +1011,6 @@ def live_loop():
             minute = now_utc.minute
             second = now_utc.second
 
-            # چک ساعت فعال
             if not is_active_session():
                 time.sleep(60)
                 continue
@@ -731,7 +1031,6 @@ def live_loop():
                             time.sleep(2)
                             continue
 
-                        # چک Bias (فقط برای هشدار - سیگنال رو رد نمی‌کنه)
                         bias_info = check_direction_bias(result['symbol'], result['direction'])
 
                         sig_key = f"{result['symbol']}_{result['entry_time'].strftime('%Y%m%d%H%M')}"
@@ -752,10 +1051,10 @@ def live_loop():
                             f"Confidence: {result['confidence']}%"
                         )
 
-                        # اضافه کردن هشدار اگه 5+ سیگنال هم‌جهت پشت سر هم
                         if bias_info['warn']:
                             msg += f"\n\nWARNING: {bias_info['streak']} same-direction signals in a row"
-                        send_telegram(msg)
+
+                        send_telegram_with_keyboard(msg)
                         print(f"Signal: {result['symbol']} {result['direction']}")
 
                         signal_id_counter += 1
@@ -763,6 +1062,8 @@ def live_loop():
                         result['saved_at'] = now_utc
                         pending_signals.append(result)
                         print(f"Signal saved for result checking")
+
+                        save_signals()
 
                     except Exception as e:
                         print(f"error {name}: {e}")
@@ -772,6 +1073,7 @@ def live_loop():
         except Exception as e:
             print(f"live_loop error: {e}")
             time.sleep(10)
+
 
 # ================== AUTO START ==================
 def auto_start():
@@ -784,7 +1086,9 @@ def auto_start():
     print("=" * 50)
 
     try:
-        send_telegram("AUTO START\n\nPreparing bot...")
+        load_signals()
+
+        send_telegram_with_keyboard("AUTO START\n\nPreparing bot...")
 
         if not trained_models:
             print("No models. Starting backtest...")
@@ -800,17 +1104,19 @@ def auto_start():
             threading.Thread(target=live_loop, daemon=True).start()
             threading.Thread(target=result_checker_loop, daemon=True).start()
             threading.Thread(target=daily_summary_loop, daemon=True).start()
+            threading.Thread(target=poll_telegram_commands, daemon=True).start()
             print("Live mode activated.")
             print("Result checker activated.")
-            send_telegram(
+            print("Daily summary activated.")
+            print("Telegram commands activated.")
+            send_telegram_with_keyboard(
                 "BOT READY!\n\n"
                 f"{len(trained_models)} models trained\n"
                 f"Expiry: 30 min\n"
-                f"Threshold: {THRESHOLD}%\n"
-                f"Max same-direction streak: {MAX_SAME_DIRECTION_STREAK}\n\n"
+                f"Threshold: {THRESHOLD}%\n\n"
                 "Signals will be sent automatically.\n"
                 "Result of each signal reported 31 min later.\n\n"
-                "Good luck!"
+                "از دکمه های پایین استفاده کن یا /help بزن"
             )
         auto_start_done = True
     except Exception as e:
@@ -819,14 +1125,17 @@ def auto_start():
         traceback.print_exc()
         send_telegram(f"Auto start error: {e}")
 
+
 @app.route('/')
 def health():
     return f"Signal Server | Models: {len(trained_models)} | Live: {live_running} | Pending: {len(pending_signals)} | Done: {len(completed_signals)}"
+
 
 @app.route('/backtest', methods=['GET'])
 def backtest_route():
     threading.Thread(target=run_backtest_background, daemon=True).start()
     return jsonify({"status": "ok", "message": "Backtest started"}), 200
+
 
 @app.route('/start_live', methods=['GET'])
 def start_live_route():
@@ -842,12 +1151,14 @@ def start_live_route():
     send_telegram("Live mode activated.")
     return jsonify({"status": "started"}), 200
 
+
 @app.route('/stop_live', methods=['GET'])
 def stop_live_route():
     global live_running
     live_running = False
     send_telegram("Live mode stopped.")
     return jsonify({"status": "stopped"}), 200
+
 
 @app.route('/status', methods=['GET'])
 def status_route():
@@ -860,6 +1171,7 @@ def status_route():
         "completed": len(completed_signals),
         "direction_streak": direction_streak,
     }), 200
+
 
 @app.route('/analysis', methods=['GET'])
 def analysis_route():
@@ -885,16 +1197,16 @@ def analysis_route():
             }
 
     return jsonify(result), 200
-    
+
+
 @app.route('/test_features', methods=['GET'])
 def test_features_route():
     import subprocess
     import sys
     subprocess.Popen([sys.executable, "feature_test.py"])
-    send_telegram("تست فیچرها شروع شد. نتایج تا 15-20 دقیقه دیگه میاد.")
+    send_telegram("Feature test started. Results in 15-20 min.")
     return jsonify({"status": "ok", "message": "Feature test started"}), 200
 
-@app.route('/stats', methods=['GET'])
 
 @app.route('/stats', methods=['GET'])
 def stats_route():
@@ -922,9 +1234,11 @@ def stats_route():
         "recent": recent_data,
     }), 200
 
+
 # ==================== AUTO START AT MODULE LEVEL ====================
 _startup_thread = threading.Thread(target=auto_start, daemon=True)
 _startup_thread.start()
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
