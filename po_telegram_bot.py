@@ -36,6 +36,12 @@ THRESHOLD = 65
 N_FOLDS = 4
 MIN_TRAIN_RATIO = 0.4
 
+# ================== OPTIMIZATION ==================
+# کاهش outputsize برای live (کند تر نمی شه)
+LIVE_LTF_SIZE = 250   # به جای 500
+LIVE_HTF_SIZE = 150   # به جای 200
+HTF_CACHE_DURATION = 3900  # 65 دقیقه
+
 INITIAL_BANKROLL = 1000.0
 PAYOUT = 0.85
 STAKE_PCT = 0.01
@@ -70,6 +76,27 @@ last_update_id = 0
 
 # ================== SIGNALS FILE ==================
 SIGNALS_FILE = "signals_data.json"
+
+# ================== HTF CACHE (بهینه سازی) ==================
+htf_cache = {}  # {symbol: (cache_time, dataframe)}
+
+
+def get_htf_data(symbol):
+    """دریافت داده 1h از کش یا درخواست جدید"""
+    now = time.time()
+    if symbol in htf_cache:
+        cache_time, cache_data = htf_cache[symbol]
+        if now - cache_time < HTF_CACHE_DURATION:
+            return cache_data
+
+    # کش منقضی شده → درخواست جدید
+    print(f"HTF cache refresh for {symbol}")
+    td = TDClient(apikey=TWELVE_DATA_API_KEY)
+    ts_h = td.time_series(symbol=symbol, interval=HTF_INTERVAL, outputsize=LIVE_HTF_SIZE, timezone="UTC")
+    df_h = ts_h.as_pandas()
+    if df_h is not None and not df_h.empty:
+        htf_cache[symbol] = (now, df_h)
+    return df_h
 
 
 def send_telegram(message, reply_markup=None):
@@ -117,7 +144,6 @@ def fmt_iran(dt):
 
 # ================== SAVE / LOAD SIGNALS ==================
 def _serialize_signal(s):
-    """تبدیل سیگنال به فرمت قابل ذخیره"""
     s_copy = s.copy()
     for key in ['entry_time', 'expiry_time', 'saved_at']:
         if key in s_copy and hasattr(s_copy[key], 'isoformat'):
@@ -126,7 +152,6 @@ def _serialize_signal(s):
 
 
 def _deserialize_signal(s):
-    """تبدیل سیگنال از فرمت ذخیره شده"""
     for key in ['entry_time', 'expiry_time', 'saved_at']:
         if key in s and isinstance(s[key], str):
             try:
@@ -137,7 +162,6 @@ def _deserialize_signal(s):
 
 
 def save_signals():
-    """ذخیره سیگنال ها توی فایل"""
     try:
         pending_serialized = [_serialize_signal(s) for s in pending_signals]
         completed_serialized = [_serialize_signal(s) for s in completed_signals]
@@ -157,7 +181,6 @@ def save_signals():
 
 
 def load_signals():
-    """بازیابی سیگنال ها از فایل"""
     global pending_signals, completed_signals, signal_id_counter
     try:
         if not os.path.exists(SIGNALS_FILE):
@@ -233,7 +256,8 @@ def send_status_command():
     msg += f"Live: {'فعال' if live_running else 'غیرفعال'}\n"
     msg += f"Backtest: {'در حال اجرا' if backtest_running else 'متوقف'}\n"
     msg += f"در انتظار: {len(pending_signals)}\n"
-    msg += f"تکمیل شده: {len(completed_signals)}\n\n"
+    msg += f"تکمیل شده: {len(completed_signals)}\n"
+    msg += f"HTF Cache: {len(htf_cache)} items\n\n"
 
     if trained_models:
         msg += "جفت ارزهای آموزش دیده:\n"
@@ -323,7 +347,6 @@ def send_today_command():
 
 
 def handle_command(update):
-    """پردازش دستورات تلگرام (چه از دکمه چه از متن)"""
     global live_running
     try:
         msg = update.get("message") or update.get("edited_message")
@@ -333,19 +356,16 @@ def handle_command(update):
         chat_id = msg.get("chat", {}).get("id")
         text = (msg.get("text") or "").strip()
 
-        # چک کن از چت خودمونه
         if str(chat_id) != str(CHAT_ID):
             return
 
         if not text:
             return
 
-        # نرمال کردن: دستور یا متن دکمه
         cmd = text.split()[0].lower()
         if cmd.startswith("/"):
             cmd = cmd.split("@")[0]
 
-        # دکمه های کیبورد
         if text == "آمار" or cmd == "/stats":
             send_stats_command()
         elif text == "وضعیت" or cmd == "/status":
@@ -380,7 +400,6 @@ def handle_command(update):
 
 
 def poll_telegram_commands():
-    """حلقه دریافت دستورات تلگرام"""
     global last_update_id
 
     time.sleep(30)
@@ -683,16 +702,21 @@ def run_backtest_background():
     finally:
         backtest_running = False
 
+
+# ================== ANALYZE LIVE (بهینه شده) ==================
 def analyze_live(symbol):
     try:
+        # 1. دریافت 15min (فقط این درخواست می شه)
         td = TDClient(apikey=TWELVE_DATA_API_KEY)
-        ts = td.time_series(symbol=symbol, interval=INTERVAL, outputsize=500, timezone="UTC")
+        ts = td.time_series(symbol=symbol, interval=INTERVAL, outputsize=LIVE_LTF_SIZE, timezone="UTC")
         df = ts.as_pandas()
-        if df is None or df.empty or len(df) < 250:
+        if df is None or df.empty or len(df) < 200:
             return None
-        time.sleep(8)
-        ts_h = td.time_series(symbol=symbol, interval=HTF_INTERVAL, outputsize=200, timezone="UTC")
-        df_h = ts_h.as_pandas()
+
+        # 2. دریافت 1h از کش (سریع)
+        df_h = get_htf_data(symbol)
+        if df_h is None or df_h.empty:
+            return None
 
         df = df.rename(columns=str.lower).sort_index()
         df_h = df_h.rename(columns=str.lower).sort_index()
@@ -702,7 +726,7 @@ def analyze_live(symbol):
         df = merge_htf_ltf(df, htf_feat)
         df = df.dropna()
 
-        if len(df) < 250:
+        if len(df) < 200:
             return None
 
         last_row = df.iloc[-1]
@@ -758,6 +782,7 @@ def analyze_live(symbol):
             "error": str(e)[:200],
         }
         return None
+
 
 def check_signal_result(signal):
     try:
@@ -1001,6 +1026,7 @@ def daily_summary_loop():
             time.sleep(60)
 
 
+# ================== LIVE LOOP (بهینه شده) ==================
 def live_loop():
     global live_running, signal_id_counter
     last_signal_time = {}
@@ -1015,27 +1041,29 @@ def live_loop():
                 time.sleep(60)
                 continue
 
-            if minute % 15 == 0 and 5 <= second <= 25:
+            # هر 15 دقیقه، 5-10 ثانیه بعد از بسته شدن کندل
+            if minute % 15 == 0 and 5 <= second <= 10:
                 slot_key = now_utc.strftime("%Y%m%d%H%M")
                 if slot_key == last_signal_time.get("_slot"):
-                    time.sleep(5)
+                    time.sleep(2)
                     continue
                 last_signal_time["_slot"] = slot_key
 
+                start_time = time.time()
                 print(f"Scanning signals at {to_iran(now_utc).strftime('%H:%M')} Iran")
 
                 for name, sym in SYMBOLS.items():
                     try:
                         result = analyze_live(sym)
                         if result is None:
-                            time.sleep(2)
+                            time.sleep(3)
                             continue
 
                         bias_info = check_direction_bias(result['symbol'], result['direction'])
 
                         sig_key = f"{result['symbol']}_{result['entry_time'].strftime('%Y%m%d%H%M')}"
                         if sig_key == last_signal_time.get(result['symbol']):
-                            time.sleep(2)
+                            time.sleep(3)
                             continue
                         last_signal_time[result['symbol']] = sig_key
 
@@ -1054,22 +1082,31 @@ def live_loop():
                         if bias_info['warn']:
                             msg += f"\n\nWARNING: {bias_info['streak']} same-direction signals in a row"
 
-                        send_telegram_with_keyboard(msg)
+                        # ارسال در thread جداگانه (غیر بلاک)
+                        threading.Thread(
+                            target=send_telegram_with_keyboard,
+                            args=(msg,),
+                            daemon=True
+                        ).start()
+
                         print(f"Signal: {result['symbol']} {result['direction']}")
 
                         signal_id_counter += 1
                         result['id'] = signal_id_counter
                         result['saved_at'] = now_utc
                         pending_signals.append(result)
-                        print(f"Signal saved for result checking")
 
                         save_signals()
 
                     except Exception as e:
                         print(f"error {name}: {e}")
-                    time.sleep(2)
+                    # فاصله 3 ثانیه بین جفت ها (rate limit)
+                    time.sleep(3)
 
-            time.sleep(5)
+                elapsed = round(time.time() - start_time, 1)
+                print(f"Scan completed in {elapsed}s")
+
+            time.sleep(2)
         except Exception as e:
             print(f"live_loop error: {e}")
             time.sleep(10)
@@ -1128,7 +1165,7 @@ def auto_start():
 
 @app.route('/')
 def health():
-    return f"Signal Server | Models: {len(trained_models)} | Live: {live_running} | Pending: {len(pending_signals)} | Done: {len(completed_signals)}"
+    return f"Signal Server | Models: {len(trained_models)} | Live: {live_running} | Pending: {len(pending_signals)} | Done: {len(completed_signals)} | Cache: {len(htf_cache)}"
 
 
 @app.route('/backtest', methods=['GET'])
@@ -1170,6 +1207,7 @@ def status_route():
         "pending": len(pending_signals),
         "completed": len(completed_signals),
         "direction_streak": direction_streak,
+        "htf_cache_size": len(htf_cache),
     }), 200
 
 
