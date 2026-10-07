@@ -5,6 +5,7 @@ import time
 import threading
 import requests
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, jsonify
 import pandas as pd
 import numpy as np
@@ -37,16 +38,14 @@ N_FOLDS = 4
 MIN_TRAIN_RATIO = 0.4
 
 # ================== OPTIMIZATION ==================
-# کاهش outputsize برای live (کند تر نمی شه)
-LIVE_LTF_SIZE = 250   # به جای 500
-LIVE_HTF_SIZE = 150   # به جای 200
+LIVE_LTF_SIZE = 400   # کافی برای EMA200 + buffer
+LIVE_HTF_SIZE = 200   # کافی برای EMA50 + buffer
 HTF_CACHE_DURATION = 3900  # 65 دقیقه
 
 INITIAL_BANKROLL = 1000.0
 PAYOUT = 0.85
 STAKE_PCT = 0.01
 
-# حداکثر سیگنال هم‌جهت پشت سر هم (برای هشدار)
 MAX_SAME_DIRECTION_STREAK = 5
 
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
@@ -57,46 +56,44 @@ live_running = False
 trained_models = {}
 auto_start_done = False
 
-# ================== SIGNAL STATS ==================
 pending_signals = []
 completed_signals = []
 signal_id_counter = 0
 
-# ================== LAST ANALYSIS ==================
 last_analysis = {}
-
-# ================== BIAS TRACKING ==================
 direction_streak = {}
-
-# ================== DAILY SUMMARY ==================
 daily_summary_sent = {}
-
-# ================== TELEGRAM POLLING ==================
 last_update_id = 0
 
-# ================== SIGNALS FILE ==================
 SIGNALS_FILE = "signals_data.json"
 
-# ================== HTF CACHE (بهینه سازی) ==================
-htf_cache = {}  # {symbol: (cache_time, dataframe)}
+# ================== HTF CACHE ==================
+htf_cache = {}
+htf_cache_lock = threading.Lock()
 
 
 def get_htf_data(symbol):
     """دریافت داده 1h از کش یا درخواست جدید"""
-    now = time.time()
-    if symbol in htf_cache:
-        cache_time, cache_data = htf_cache[symbol]
-        if now - cache_time < HTF_CACHE_DURATION:
-            return cache_data
+    with htf_cache_lock:
+        now = time.time()
+        if symbol in htf_cache:
+            cache_time, cache_data = htf_cache[symbol]
+            if now - cache_time < HTF_CACHE_DURATION:
+                return cache_data
 
     # کش منقضی شده → درخواست جدید
-    print(f"HTF cache refresh for {symbol}")
-    td = TDClient(apikey=TWELVE_DATA_API_KEY)
-    ts_h = td.time_series(symbol=symbol, interval=HTF_INTERVAL, outputsize=LIVE_HTF_SIZE, timezone="UTC")
-    df_h = ts_h.as_pandas()
-    if df_h is not None and not df_h.empty:
-        htf_cache[symbol] = (now, df_h)
-    return df_h
+    try:
+        print(f"HTF refresh: {symbol}")
+        td = TDClient(apikey=TWELVE_DATA_API_KEY)
+        ts_h = td.time_series(symbol=symbol, interval=HTF_INTERVAL, outputsize=LIVE_HTF_SIZE, timezone="UTC")
+        df_h = ts_h.as_pandas()
+        if df_h is not None and not df_h.empty:
+            with htf_cache_lock:
+                htf_cache[symbol] = (now, df_h)
+            return df_h
+    except Exception as e:
+        print(f"HTF fetch error {symbol}: {e}")
+    return None
 
 
 def send_telegram(message, reply_markup=None):
@@ -113,7 +110,6 @@ def send_telegram(message, reply_markup=None):
 
 
 def get_main_keyboard():
-    """کیبورد اصلی با دکمه ها"""
     keyboard = {
         "keyboard": [
             [{"text": "آمار"}, {"text": "وضعیت"}],
@@ -128,7 +124,6 @@ def get_main_keyboard():
 
 
 def send_telegram_with_keyboard(message):
-    """ارسال پیام با کیبورد"""
     send_telegram(message, reply_markup=get_main_keyboard())
 
 
@@ -142,7 +137,7 @@ def fmt_iran(dt):
     return to_iran(dt).strftime("%H:%M")
 
 
-# ================== SAVE / LOAD SIGNALS ==================
+# ================== SAVE / LOAD ==================
 def _serialize_signal(s):
     s_copy = s.copy()
     for key in ['entry_time', 'expiry_time', 'saved_at']:
@@ -165,17 +160,14 @@ def save_signals():
     try:
         pending_serialized = [_serialize_signal(s) for s in pending_signals]
         completed_serialized = [_serialize_signal(s) for s in completed_signals]
-
         data = {
             "pending": pending_serialized,
             "completed": completed_serialized,
             "signal_counter": signal_id_counter,
             "saved_at": datetime.now(timezone.utc).isoformat(),
         }
-
         with open(SIGNALS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        print(f"Signals saved: {len(pending_serialized)} pending, {len(completed_serialized)} completed")
     except Exception as e:
         print(f"save_signals error: {e}")
 
@@ -184,16 +176,12 @@ def load_signals():
     global pending_signals, completed_signals, signal_id_counter
     try:
         if not os.path.exists(SIGNALS_FILE):
-            print("No signals file found. Starting fresh.")
             return
-
         with open(SIGNALS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-
         pending_signals = [_deserialize_signal(s) for s in data.get("pending", [])]
         completed_signals = [_deserialize_signal(s) for s in data.get("completed", [])]
         signal_id_counter = data.get("signal_counter", 0)
-
         print(f"Signals loaded: {len(pending_signals)} pending, {len(completed_signals)} completed")
     except Exception as e:
         print(f"load_signals error: {e}")
@@ -202,18 +190,10 @@ def load_signals():
 # ================== TELEGRAM COMMANDS ==================
 def send_help_command():
     msg = (
-        "دستورات موجود\n"
-        "====================\n\n"
-        "از دکمه های پایین صفحه استفاده کن\n"
-        "یا این دستورات رو بزن:\n\n"
-        "/stats - آمار کلی\n"
-        "/status - وضعیت ربات\n"
-        "/analysis - آخرین تحلیل\n"
-        "/today - آمار امروز\n"
-        "/daily - خلاصه امروز\n"
-        "/pause - توقف موقت\n"
-        "/resume - شروع مجدد\n"
-        "/help - این راهنما"
+        "دستورات موجود\n====================\n\n"
+        "از دکمه های پایین صفحه استفاده کن یا:\n\n"
+        "/stats - آمار کلی\n/status - وضعیت ربات\n/analysis - آخرین تحلیل\n"
+        "/today - آمار امروز\n/daily - خلاصه امروز\n/pause - توقف\n/resume - شروع\n/help - راهنما"
     )
     send_telegram_with_keyboard(msg)
 
@@ -226,51 +206,38 @@ def send_stats_command():
     decided = wins + losses
     wr = round(wins / decided * 100, 1) if decided > 0 else 0
 
-    msg = "آمار کلی\n"
-    msg += "====================\n\n"
-    msg += f"کل سیگنال: {total}\n"
-    msg += f"برد: {wins} | باخت: {losses}"
+    msg = "آمار کلی\n====================\n\n"
+    msg += f"کل سیگنال: {total}\nبرد: {wins} | باخت: {losses}"
     if ties > 0:
         msg += f" | مساوی: {ties}"
-    msg += f"\nوین ریت: {wr}%\n"
-    msg += f"در انتظار: {len(pending_signals)}\n\n"
+    msg += f"\nوین ریت: {wr}%\nدر انتظار: {len(pending_signals)}\n\n"
 
     if completed_signals:
         msg += "آخرین 5 سیگنال:\n"
         for s in completed_signals[-5:]:
-            if s.get('is_win') is True:
-                emoji = "برد"
-            elif s.get('is_win') is False:
-                emoji = "باخت"
-            else:
-                emoji = "مساوی"
+            emoji = "برد" if s.get('is_win') is True else ("باخت" if s.get('is_win') is False else "مساوی")
             msg += f"  {s['symbol']} {s['direction']} - {emoji}\n"
 
     send_telegram_with_keyboard(msg)
 
 
 def send_status_command():
-    msg = "وضعیت ربات\n"
-    msg += "====================\n\n"
+    msg = "وضعیت ربات\n====================\n\n"
     msg += f"مدل ها: {len(trained_models)}\n"
     msg += f"Live: {'فعال' if live_running else 'غیرفعال'}\n"
     msg += f"Backtest: {'در حال اجرا' if backtest_running else 'متوقف'}\n"
     msg += f"در انتظار: {len(pending_signals)}\n"
     msg += f"تکمیل شده: {len(completed_signals)}\n"
     msg += f"HTF Cache: {len(htf_cache)} items\n\n"
-
     if trained_models:
-        msg += "جفت ارزهای آموزش دیده:\n"
+        msg += "جفت ارزها:\n"
         for name in trained_models.keys():
             msg += f"  {name}\n"
-
     send_telegram_with_keyboard(msg)
 
 
 def send_analysis_command():
-    msg = "آخرین تحلیل\n"
-    msg += "====================\n\n"
-
+    msg = "آخرین تحلیل\n====================\n\n"
     if not last_analysis:
         msg += "هنوز تحلیلی انجام نشده."
     else:
@@ -279,20 +246,13 @@ def send_analysis_command():
             direction = info.get('direction', '?')
             status = info.get('status', '?')
             time_ir = info.get('time_iran', '?')
-
             if status == 'signal':
                 status_fa = 'سیگنال'
             elif status == 'rejected':
                 status_fa = 'رد شده'
             else:
                 status_fa = 'خطا'
-
-            msg += f"{sym}\n"
-            msg += f"  اطمینان: {conf}%\n"
-            msg += f"  جهت: {direction}\n"
-            msg += f"  وضعیت: {status_fa}\n"
-            msg += f"  زمان: {time_ir}\n\n"
-
+            msg += f"{sym}\n  اطمینان: {conf}%\n  جهت: {direction}\n  وضعیت: {status_fa}\n  زمان: {time_ir}\n\n"
     msg += f"آستانه: {THRESHOLD}%"
     send_telegram_with_keyboard(msg)
 
@@ -300,12 +260,10 @@ def send_analysis_command():
 def send_today_command():
     now_iran = to_iran(datetime.now(timezone.utc))
     today_start = now_iran.replace(hour=0, minute=0, second=0, microsecond=0)
-
     today_signals = []
     for s in completed_signals:
         try:
-            entry_iran = to_iran(s['entry_time'])
-            if entry_iran >= today_start:
+            if to_iran(s['entry_time']) >= today_start:
                 today_signals.append(s)
         except:
             continue
@@ -320,11 +278,8 @@ def send_today_command():
     decided = wins + losses
     wr = round(wins / decided * 100, 1) if decided > 0 else 0
 
-    msg = f"آمار امروز ({now_iran.strftime('%Y-%m-%d')})\n"
-    msg += "====================\n\n"
-    msg += f"کل: {total}\n"
-    msg += f"برد: {wins} | باخت: {losses}\n"
-    msg += f"وین ریت: {wr}%\n\n"
+    msg = f"آمار امروز ({now_iran.strftime('%Y-%m-%d')})\n====================\n\n"
+    msg += f"کل: {total}\nبرد: {wins} | باخت: {losses}\nوین ریت: {wr}%\n\nبه تفکیک:\n"
 
     pair_stats = {}
     for s in today_signals:
@@ -337,7 +292,6 @@ def send_today_command():
         elif s.get('is_win') is False:
             pair_stats[sym]['losses'] += 1
 
-    msg += "به تفکیک:\n"
     for sym, stats in pair_stats.items():
         d = stats['wins'] + stats['losses']
         pwr = round(stats['wins'] / d * 100, 1) if d > 0 else 0
@@ -352,14 +306,9 @@ def handle_command(update):
         msg = update.get("message") or update.get("edited_message")
         if not msg:
             return
-
         chat_id = msg.get("chat", {}).get("id")
         text = (msg.get("text") or "").strip()
-
-        if str(chat_id) != str(CHAT_ID):
-            return
-
-        if not text:
+        if str(chat_id) != str(CHAT_ID) or not text:
             return
 
         cmd = text.split()[0].lower()
@@ -378,39 +327,36 @@ def handle_command(update):
             send_daily_summary()
         elif text == "راهنما" or cmd == "/help":
             send_help_command()
-        elif text == "توقف" or cmd == "/pause" or cmd == "/stop":
+        elif text == "توقف" or cmd in ["/pause", "/stop"]:
             if live_running:
                 live_running = False
-                send_telegram_with_keyboard("ربات موقتا متوقف شد. برای شروع مجدد دکمه شروع رو بزن.")
+                send_telegram_with_keyboard("ربات موقتا متوقف شد.")
             else:
                 send_telegram_with_keyboard("ربات از قبل متوقف بود.")
-        elif text == "شروع" or cmd == "/resume" or cmd == "/start":
+        elif text == "شروع" or cmd in ["/resume", "/start"]:
             if not trained_models:
-                send_telegram_with_keyboard("مدل ها آموزش ندیدن. صبر کن.")
+                send_telegram_with_keyboard("مدل ها آموزش ندیدن.")
             elif live_running:
-                send_telegram_with_keyboard("ربات در حال حاضر فعاله.")
+                send_telegram_with_keyboard("ربات فعاله.")
             else:
                 live_running = True
                 threading.Thread(target=live_loop, daemon=True).start()
                 send_telegram_with_keyboard("ربات دوباره فعال شد.")
         else:
-            send_telegram_with_keyboard(f"دستور ناشناخته: {text}\n\nبرای راهنما دکمه راهنما رو بزن.")
+            send_telegram_with_keyboard(f"دستور ناشناخته: {text}")
     except Exception as e:
         print(f"handle_command error: {e}")
 
 
 def poll_telegram_commands():
     global last_update_id
-
     time.sleep(30)
-
     while True:
         try:
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
             params = {"offset": last_update_id + 1, "timeout": 30}
             response = requests.get(url, params=params, timeout=40)
             data = response.json()
-
             if data.get("ok"):
                 for update in data.get("result", []):
                     last_update_id = update["update_id"]
@@ -658,10 +604,8 @@ def run_backtest_background():
     try:
         send_telegram(
             "BACKTEST STARTED\n\n"
-            "4 pairs selected\n"
-            "Expiry: 30 min\n"
-            f"Threshold: {THRESHOLD}%\n\n"
-            "Takes 5-8 minutes..."
+            "4 pairs selected\nExpiry: 30 min\n"
+            f"Threshold: {THRESHOLD}%\n\nTakes 5-8 minutes..."
         )
 
         results = []
@@ -671,15 +615,10 @@ def run_backtest_background():
                 send_telegram(f"ERROR {name}: {r['error']}")
                 continue
             results.append(r)
-
             msg = (
-                f"====================\n"
-                f"{r['symbol']}\n"
-                f"====================\n\n"
-                f"Win Rate: {r['wr']}%\n"
-                f"Signals: {r['signals']} (~{r['signals_per_day']}/day)\n"
-                f"Bank: $1000 -> ${r['final_bankroll']}\n"
-                f"Return: {r['return_pct']}%\n"
+                f"====================\n{r['symbol']}\n====================\n\n"
+                f"Win Rate: {r['wr']}%\nSignals: {r['signals']} (~{r['signals_per_day']}/day)\n"
+                f"Bank: $1000 -> ${r['final_bankroll']}\nReturn: {r['return_pct']}%\n"
                 f"Folds: {r['folds']}"
             )
             send_telegram(msg)
@@ -689,14 +628,9 @@ def run_backtest_background():
             total_wins = sum(r['wins'] for r in results)
             avg_wr = round(total_wins / total_signals * 100, 2) if total_signals > 0 else 0
             avg_ret = round(sum(r['return_pct'] for r in results) / len(results), 2)
-
             final = (
-                f"====================\n"
-                f"SUMMARY\n"
-                f"====================\n\n"
-                f"Avg Win Rate: {avg_wr}%\n"
-                f"Total Signals: {total_signals}\n"
-                f"Avg Return: +{avg_ret}%"
+                f"====================\nSUMMARY\n====================\n\n"
+                f"Avg Win Rate: {avg_wr}%\nTotal Signals: {total_signals}\nAvg Return: +{avg_ret}%"
             )
             send_telegram(final)
     finally:
@@ -706,16 +640,19 @@ def run_backtest_background():
 # ================== ANALYZE LIVE (بهینه شده) ==================
 def analyze_live(symbol):
     try:
-        # 1. دریافت 15min (فقط این درخواست می شه)
+        start = time.time()
+        # 1. دریافت 15min
         td = TDClient(apikey=TWELVE_DATA_API_KEY)
         ts = td.time_series(symbol=symbol, interval=INTERVAL, outputsize=LIVE_LTF_SIZE, timezone="UTC")
         df = ts.as_pandas()
-        if df is None or df.empty or len(df) < 200:
+        if df is None or df.empty or len(df) < 250:
+            print(f"analyze {symbol}: not enough data ({len(df) if df is not None else 0})")
             return None
 
-        # 2. دریافت 1h از کش (سریع)
+        # 2. دریافت 1h از کش
         df_h = get_htf_data(symbol)
         if df_h is None or df_h.empty:
+            print(f"analyze {symbol}: no HTF data")
             return None
 
         df = df.rename(columns=str.lower).sort_index()
@@ -727,14 +664,17 @@ def analyze_live(symbol):
         df = df.dropna()
 
         if len(df) < 200:
+            print(f"analyze {symbol}: after dropna only {len(df)} rows")
             return None
 
         last_row = df.iloc[-1]
         if last_row[FEATURE_COLS].isna().any():
+            print(f"analyze {symbol}: NaN in features")
             return None
 
         model = trained_models.get(symbol)
         if model is None:
+            print(f"analyze {symbol}: no model")
             return None
 
         X = last_row[FEATURE_COLS].values.astype(float).reshape(1, -1)
@@ -757,6 +697,9 @@ def analyze_live(symbol):
             "threshold": THRESHOLD,
         }
 
+        elapsed = round(time.time() - start, 2)
+        print(f"analyze {symbol}: {confidence:.1f}% {direction_tmp} ({elapsed}s)")
+
         if confidence < THRESHOLD:
             return None
 
@@ -773,6 +716,8 @@ def analyze_live(symbol):
         }
     except Exception as e:
         print(f"analyze error for {symbol}: {e}")
+        import traceback
+        traceback.print_exc()
         last_analysis[symbol] = {
             "confidence": 0,
             "direction": "ERROR",
@@ -787,16 +732,10 @@ def analyze_live(symbol):
 def check_signal_result(signal):
     try:
         td = TDClient(apikey=TWELVE_DATA_API_KEY)
-        ts = td.time_series(
-            symbol=signal['symbol'],
-            interval=INTERVAL,
-            outputsize=10,
-            timezone="UTC"
-        )
+        ts = td.time_series(symbol=signal['symbol'], interval=INTERVAL, outputsize=10, timezone="UTC")
         df = ts.as_pandas()
         if df is None or df.empty:
             return None
-
         df = df.rename(columns=str.lower).sort_index()
 
         expiry_time = signal['expiry_time']
@@ -820,14 +759,11 @@ def check_signal_result(signal):
         else:
             is_win = exit_price < entry_price
 
-        return {
-            'result': 'WIN' if is_win else 'LOSS',
-            'exit_price': exit_price,
-            'is_win': is_win,
-        }
+        return {'result': 'WIN' if is_win else 'LOSS', 'exit_price': exit_price, 'is_win': is_win}
     except Exception as e:
         print(f"check_result error: {e}")
         return None
+
 
 def send_signal_result(signal):
     if signal['result'] == 'WIN':
@@ -838,14 +774,10 @@ def send_signal_result(signal):
         title = "TRADE TIE"
 
     msg = (
-        f"{title}\n"
-        f"====================\n"
-        f"Symbol: {signal['symbol']}\n"
-        f"Direction: {signal['direction']}\n"
-        f"Entry: {fmt_iran(signal['entry_time'])} IRAN\n"
-        f"End: {fmt_iran(signal['expiry_time'])} IRAN\n"
-        f"Price In: {signal['entry_price']:.5f}\n"
-        f"Price Out: {signal['exit_price']:.5f}\n"
+        f"{title}\n====================\n"
+        f"Symbol: {signal['symbol']}\nDirection: {signal['direction']}\n"
+        f"Entry: {fmt_iran(signal['entry_time'])} IRAN\nEnd: {fmt_iran(signal['expiry_time'])} IRAN\n"
+        f"Price In: {signal['entry_price']:.5f}\nPrice Out: {signal['exit_price']:.5f}\n"
     )
 
     total = len(completed_signals)
@@ -856,44 +788,33 @@ def send_signal_result(signal):
     if total > 0:
         decided = wins + losses
         wr = round(wins / decided * 100, 1) if decided > 0 else 0
-        msg += (
-            f"\nSTATS:\n"
-            f"Total: {total} | W: {wins} | L: {losses}"
-        )
+        msg += f"\nSTATS:\nTotal: {total} | W: {wins} | L: {losses}"
         if ties > 0:
             msg += f" | T: {ties}"
         msg += f"\nWin Rate: {wr}%"
 
     send_telegram_with_keyboard(msg)
 
+
 def result_checker_loop():
     global pending_signals, completed_signals
-
     while True:
         try:
             now_utc = datetime.now(timezone.utc)
-
             for signal in list(pending_signals):
                 check_time = signal['expiry_time'] + timedelta(minutes=1)
-
                 if now_utc >= check_time:
-                    print(f"Checking result {signal['symbol']} {signal['direction']}")
+                    print(f"Checking result {signal['symbol']}")
                     result = check_signal_result(signal)
-
                     if result is None:
                         continue
-
                     pending_signals.remove(signal)
                     signal['result'] = result['result']
                     signal['exit_price'] = result['exit_price']
                     signal['is_win'] = result['is_win']
                     completed_signals.append(signal)
-
                     send_signal_result(signal)
-                    print(f"Result: {signal['symbol']} -> {signal['result']}")
-
                     save_signals()
-
             time.sleep(30)
         except Exception as e:
             print(f"result_checker error: {e}")
@@ -905,10 +826,8 @@ def is_active_session():
     now_utc = datetime.now(timezone.utc)
     weekday = now_utc.weekday()
     hour = now_utc.hour
-
     if weekday >= 5:
         return False
-
     return 8 <= hour < 21
 
 
@@ -917,15 +836,12 @@ def check_direction_bias(symbol, direction):
     if symbol not in direction_streak:
         direction_streak[symbol] = {"direction": direction, "count": 1}
         return {"streak": 1, "warn": False}
-
     info = direction_streak[symbol]
-
     if info["direction"] == direction:
         info["count"] += 1
     else:
         direction_streak[symbol] = {"direction": direction, "count": 1}
         info = direction_streak[symbol]
-
     warn = info["count"] >= MAX_SAME_DIRECTION_STREAK
     return {"streak": info["count"], "warn": warn}
 
@@ -937,18 +853,15 @@ def send_daily_summary():
     today_signals = []
     for s in completed_signals:
         try:
-            entry_iran = to_iran(s['entry_time'])
-            if entry_iran >= today_start:
+            if to_iran(s['entry_time']) >= today_start:
                 today_signals.append(s)
         except:
             continue
 
     if not today_signals:
         send_telegram_with_keyboard(
-            "خلاصه روز\n"
-            "====================\n\n"
-            f"تاریخ: {now_iran.strftime('%Y-%m-%d')}\n\n"
-            "امروز هیچ سیگنالی صادر نشد"
+            "خلاصه روز\n====================\n\n"
+            f"تاریخ: {now_iran.strftime('%Y-%m-%d')}\n\nامروز هیچ سیگنالی صادر نشد"
         )
         return
 
@@ -970,33 +883,24 @@ def send_daily_summary():
         elif s.get('is_win') is False:
             pair_stats[sym]['losses'] += 1
 
-    msg = "خلاصه روز\n"
-    msg += "====================\n"
+    msg = "خلاصه روز\n====================\n"
     msg += f"تاریخ: {now_iran.strftime('%Y-%m-%d')}\n\n"
-    msg += f"کل سیگنال: {total}\n"
-    msg += f"برد: {wins} | باخت: {losses}"
+    msg += f"کل سیگنال: {total}\nبرد: {wins} | باخت: {losses}"
     if ties > 0:
         msg += f" | مساوی: {ties}"
-    msg += f"\nوین ریت: {wr}%\n\n"
+    msg += f"\nوین ریت: {wr}%\n\nبه تفکیک جفت ارز:\n"
 
-    msg += "به تفکیک جفت ارز:\n"
-    best_pair = None
-    best_wr = 0
-    worst_pair = None
-    worst_wr = 100
-
+    best_pair, best_wr = None, 0
+    worst_pair, worst_wr = None, 100
     for sym, stats in pair_stats.items():
         d = stats['wins'] + stats['losses']
         pair_wr = round(stats['wins'] / d * 100, 1) if d > 0 else 0
         msg += f"  {sym}: {stats['total']} سیگنال ({pair_wr}%)\n"
-
         if stats['total'] >= 3:
             if pair_wr > best_wr:
-                best_wr = pair_wr
-                best_pair = sym
+                best_wr, best_pair = pair_wr, sym
             if pair_wr < worst_wr:
-                worst_wr = pair_wr
-                worst_pair = sym
+                worst_wr, worst_pair = pair_wr, sym
 
     if best_pair:
         msg += f"\nبهترین: {best_pair} ({best_wr}%)"
@@ -1011,24 +915,53 @@ def daily_summary_loop():
         try:
             now_utc = datetime.now(timezone.utc)
             iran_time = to_iran(now_utc)
-
             if iran_time.hour == 0 and iran_time.minute == 30:
                 today_key = iran_time.strftime("%Y-%m-%d")
-
                 if today_key not in daily_summary_sent:
                     daily_summary_sent[today_key] = True
                     print(f"Sending daily summary for {today_key}")
                     send_daily_summary()
-
             time.sleep(60)
         except Exception as e:
             print(f"daily_summary error: {e}")
             time.sleep(60)
 
 
-# ================== LIVE LOOP (بهینه شده) ==================
+# ================== LIVE LOOP (موازی) ==================
+def process_signal(symbol, result, now_utc, last_signal_time):
+    """پردازش سیگنال (در thread جداگانه)"""
+    global signal_id_counter
+    try:
+        bias_info = check_direction_bias(result['symbol'], result['direction'])
+        sig_key = f"{result['symbol']}_{result['entry_time'].strftime('%Y%m%d%H%M')}"
+        if sig_key == last_signal_time.get(result['symbol']):
+            return
+        last_signal_time[result['symbol']] = sig_key
+
+        emoji = "CALL" if result['direction'] == "CALL" else "PUT"
+        msg = (
+            f"SIGNAL {emoji}\n====================\n"
+            f"Symbol: {result['symbol']}\nEntry: {fmt_iran(result['entry_time'])} IRAN\n"
+            f"Expiry: 30 min\nEnd: {fmt_iran(result['expiry_time'])} IRAN\n"
+            f"Price: {result['entry_price']:.5f}\nConfidence: {result['confidence']}%"
+        )
+        if bias_info['warn']:
+            msg += f"\n\nWARNING: {bias_info['streak']} same-direction signals in a row"
+
+        send_telegram_with_keyboard(msg)
+        print(f"Signal sent: {result['symbol']} {result['direction']}")
+
+        signal_id_counter += 1
+        result['id'] = signal_id_counter
+        result['saved_at'] = now_utc
+        pending_signals.append(result)
+        save_signals()
+    except Exception as e:
+        print(f"process_signal error: {e}")
+
+
 def live_loop():
-    global live_running, signal_id_counter
+    global live_running
     last_signal_time = {}
 
     while live_running:
@@ -1041,70 +974,34 @@ def live_loop():
                 time.sleep(60)
                 continue
 
-            # هر 15 دقیقه، 5-10 ثانیه بعد از بسته شدن کندل
-            if minute % 15 == 0 and 5 <= second <= 10:
+            # پنجره اسکن: 5-15 ثانیه بعد از بسته شدن کندل
+            if minute % 15 == 0 and 5 <= second <= 15:
                 slot_key = now_utc.strftime("%Y%m%d%H%M")
                 if slot_key == last_signal_time.get("_slot"):
-                    time.sleep(2)
+                    time.sleep(1)
                     continue
                 last_signal_time["_slot"] = slot_key
 
                 start_time = time.time()
-                print(f"Scanning signals at {to_iran(now_utc).strftime('%H:%M')} Iran")
+                print(f"=== Scanning at {to_iran(now_utc).strftime('%H:%M')} Iran ===")
 
-                for name, sym in SYMBOLS.items():
-                    try:
-                        result = analyze_live(sym)
-                        if result is None:
-                            time.sleep(3)
-                            continue
+                # اجرای موازی 4 جفت
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    futures = {
+                        executor.submit(analyze_live, sym): (name, sym)
+                        for name, sym in SYMBOLS.items()
+                    }
+                    for future in as_completed(futures):
+                        name, sym = futures[future]
+                        try:
+                            result = future.result(timeout=30)
+                            if result is not None:
+                                process_signal(sym, result, now_utc, last_signal_time)
+                        except Exception as e:
+                            print(f"error {name}: {e}")
 
-                        bias_info = check_direction_bias(result['symbol'], result['direction'])
-
-                        sig_key = f"{result['symbol']}_{result['entry_time'].strftime('%Y%m%d%H%M')}"
-                        if sig_key == last_signal_time.get(result['symbol']):
-                            time.sleep(3)
-                            continue
-                        last_signal_time[result['symbol']] = sig_key
-
-                        emoji = "CALL" if result['direction'] == "CALL" else "PUT"
-                        msg = (
-                            f"SIGNAL {emoji}\n"
-                            f"====================\n"
-                            f"Symbol: {result['symbol']}\n"
-                            f"Entry: {fmt_iran(result['entry_time'])} IRAN\n"
-                            f"Expiry: 30 min\n"
-                            f"End: {fmt_iran(result['expiry_time'])} IRAN\n"
-                            f"Price: {result['entry_price']:.5f}\n"
-                            f"Confidence: {result['confidence']}%"
-                        )
-
-                        if bias_info['warn']:
-                            msg += f"\n\nWARNING: {bias_info['streak']} same-direction signals in a row"
-
-                        # ارسال در thread جداگانه (غیر بلاک)
-                        threading.Thread(
-                            target=send_telegram_with_keyboard,
-                            args=(msg,),
-                            daemon=True
-                        ).start()
-
-                        print(f"Signal: {result['symbol']} {result['direction']}")
-
-                        signal_id_counter += 1
-                        result['id'] = signal_id_counter
-                        result['saved_at'] = now_utc
-                        pending_signals.append(result)
-
-                        save_signals()
-
-                    except Exception as e:
-                        print(f"error {name}: {e}")
-                    # فاصله 3 ثانیه بین جفت ها (rate limit)
-                    time.sleep(3)
-
-                elapsed = round(time.time() - start_time, 1)
-                print(f"Scan completed in {elapsed}s")
+                elapsed = round(time.time() - start_time, 2)
+                print(f"=== Scan completed in {elapsed}s ===")
 
             time.sleep(2)
         except Exception as e:
@@ -1115,7 +1012,6 @@ def live_loop():
 # ================== AUTO START ==================
 def auto_start():
     global live_running, auto_start_done
-
     time.sleep(15)
 
     print("=" * 50)
@@ -1124,16 +1020,13 @@ def auto_start():
 
     try:
         load_signals()
-
         send_telegram_with_keyboard("AUTO START\n\nPreparing bot...")
 
         if not trained_models:
             print("No models. Starting backtest...")
             run_backtest_background()
-
             while backtest_running:
                 time.sleep(5)
-
             print(f"Backtest done. {len(trained_models)} models trained.")
 
         if trained_models and not live_running:
@@ -1143,13 +1036,9 @@ def auto_start():
             threading.Thread(target=daily_summary_loop, daemon=True).start()
             threading.Thread(target=poll_telegram_commands, daemon=True).start()
             print("Live mode activated.")
-            print("Result checker activated.")
-            print("Daily summary activated.")
-            print("Telegram commands activated.")
             send_telegram_with_keyboard(
                 "BOT READY!\n\n"
-                f"{len(trained_models)} models trained\n"
-                f"Expiry: 30 min\n"
+                f"{len(trained_models)} models trained\nExpiry: 30 min\n"
                 f"Threshold: {THRESHOLD}%\n\n"
                 "Signals will be sent automatically.\n"
                 "Result of each signal reported 31 min later.\n\n"
@@ -1221,29 +1110,14 @@ def analysis_route():
         "threshold": THRESHOLD,
         "symbols": {}
     }
-
     for name, sym in SYMBOLS.items():
         if sym in last_analysis:
             info = last_analysis[sym].copy()
             info["name"] = name
             result["symbols"][name] = info
         else:
-            result["symbols"][name] = {
-                "name": name,
-                "status": "not_analyzed_yet",
-                "message": "not analyzed yet"
-            }
-
+            result["symbols"][name] = {"name": name, "status": "not_analyzed_yet", "message": "not analyzed yet"}
     return jsonify(result), 200
-
-
-@app.route('/test_features', methods=['GET'])
-def test_features_route():
-    import subprocess
-    import sys
-    subprocess.Popen([sys.executable, "feature_test.py"])
-    send_telegram("Feature test started. Results in 15-20 min.")
-    return jsonify({"status": "ok", "message": "Feature test started"}), 200
 
 
 @app.route('/stats', methods=['GET'])
@@ -1257,19 +1131,12 @@ def stats_route():
     recent_data = []
     for s in completed_signals[-10:]:
         recent_data.append({
-            "symbol": s['symbol'],
-            "direction": s['direction'],
-            "result": s['result'],
-            "time": fmt_iran(s['entry_time']),
+            "symbol": s['symbol'], "direction": s['direction'],
+            "result": s['result'], "time": fmt_iran(s['entry_time']),
         })
     return jsonify({
-        "total": total,
-        "wins": wins,
-        "losses": losses,
-        "ties": ties,
-        "pending": len(pending_signals),
-        "win_rate": wr,
-        "recent": recent_data,
+        "total": total, "wins": wins, "losses": losses, "ties": ties,
+        "pending": len(pending_signals), "win_rate": wr, "recent": recent_data,
     }), 200
 
 
