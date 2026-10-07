@@ -38,9 +38,11 @@ N_FOLDS = 4
 MIN_TRAIN_RATIO = 0.4
 
 # ================== OPTIMIZATION ==================
-LIVE_LTF_SIZE = 400   # کافی برای EMA200 + buffer
-LIVE_HTF_SIZE = 200   # کافی برای EMA50 + buffer
-HTF_CACHE_DURATION = 3900  # 65 دقیقه
+LIVE_LTF_SIZE = 450              # ✅ کافی برای EMA200 + buffer
+LIVE_HTF_SIZE = 250              # ✅ کافی برای EMA50 + buffer
+HTF_CACHE_DURATION = 3900        # 65 دقیقه
+MAX_PARALLEL_WORKERS = 2         # ✅ کاهش به 2 (rate limit)
+HTF_REQUEST_DELAY = 2.0          # ✅ فاصله بین درخواست های HTF
 
 INITIAL_BANKROLL = 1000.0
 PAYOUT = 0.85
@@ -67,13 +69,23 @@ last_update_id = 0
 
 SIGNALS_FILE = "signals_data.json"
 
-# ================== HTF CACHE ==================
+# ================== LOCKS ==================
 htf_cache = {}
-htf_cache_lock = threading.Lock()
+htf_cache_lock = threading.Lock()       # قفل خواندن کش
+htf_fetch_lock = threading.Lock()       # ✅ قفل درخواست جدید HTF
+signal_lock = threading.Lock()          # ✅ قفل pending_signals + counter
+analysis_lock = threading.Lock()        # ✅ قفل last_analysis
+save_lock = threading.Lock()            # ✅ قفل save_signals
+streak_lock = threading.Lock()          # ✅ قفل direction_streak
 
 
+# ================== HTF CACHE (با قفل کامل) ==================
 def get_htf_data(symbol):
-    """دریافت داده 1h از کش یا درخواست جدید"""
+    """
+    دریافت داده 1h از کش یا درخواست جدید
+    ✅ با قفل کامل برای جلوگیری از rate limit
+    """
+    # چک کش
     with htf_cache_lock:
         now = time.time()
         if symbol in htf_cache:
@@ -81,18 +93,37 @@ def get_htf_data(symbol):
             if now - cache_time < HTF_CACHE_DURATION:
                 return cache_data
 
-    # کش منقضی شده → درخواست جدید
-    try:
-        print(f"HTF refresh: {symbol}")
-        td = TDClient(apikey=TWELVE_DATA_API_KEY)
-        ts_h = td.time_series(symbol=symbol, interval=HTF_INTERVAL, outputsize=LIVE_HTF_SIZE, timezone="UTC")
-        df_h = ts_h.as_pandas()
-        if df_h is not None and not df_h.empty:
-            with htf_cache_lock:
-                htf_cache[symbol] = (now, df_h)
-            return df_h
-    except Exception as e:
-        print(f"HTF fetch error {symbol}: {e}")
+    # درخواست جدید — با قفل کامل
+    with htf_fetch_lock:
+        # چک دوباره (شاید thread دیگه درخواست داده)
+        with htf_cache_lock:
+            now = time.time()
+            if symbol in htf_cache:
+                cache_time, cache_data = htf_cache[symbol]
+                if now - cache_time < HTF_CACHE_DURATION:
+                    return cache_data
+
+        try:
+            print(f"[HTF] Fetching {symbol}...")
+            td = TDClient(apikey=TWELVE_DATA_API_KEY)
+            ts_h = td.time_series(
+                symbol=symbol,
+                interval=HTF_INTERVAL,
+                outputsize=LIVE_HTF_SIZE,
+                timezone="UTC"
+            )
+            df_h = ts_h.as_pandas()
+
+            if df_h is not None and not df_h.empty:
+                with htf_cache_lock:
+                    htf_cache[symbol] = (time.time(), df_h)
+                print(f"[HTF] Cached {symbol} ({len(df_h)} candles)")
+                time.sleep(HTF_REQUEST_DELAY)
+                return df_h
+        except Exception as e:
+            print(f"[HTF] Error {symbol}: {e}")
+            time.sleep(HTF_REQUEST_DELAY)
+
     return None
 
 
@@ -109,8 +140,17 @@ def send_telegram(message, reply_markup=None):
         print(f"telegram error: {e}")
 
 
+def send_telegram_async(message, reply_markup=None):
+    """✅ ارسال در thread جداگانه (غیر بلاک)"""
+    threading.Thread(
+        target=send_telegram,
+        args=(message, reply_markup),
+        daemon=True
+    ).start()
+
+
 def get_main_keyboard():
-    keyboard = {
+    return {
         "keyboard": [
             [{"text": "آمار"}, {"text": "وضعیت"}],
             [{"text": "تحلیل"}, {"text": "امروز"}],
@@ -120,7 +160,6 @@ def get_main_keyboard():
         "resize_keyboard": True,
         "is_persistent": True,
     }
-    return keyboard
 
 
 def send_telegram_with_keyboard(message):
@@ -157,19 +196,21 @@ def _deserialize_signal(s):
 
 
 def save_signals():
-    try:
-        pending_serialized = [_serialize_signal(s) for s in pending_signals]
-        completed_serialized = [_serialize_signal(s) for s in completed_signals]
-        data = {
-            "pending": pending_serialized,
-            "completed": completed_serialized,
-            "signal_counter": signal_id_counter,
-            "saved_at": datetime.now(timezone.utc).isoformat(),
-        }
-        with open(SIGNALS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"save_signals error: {e}")
+    """✅ با قفل"""
+    with save_lock:
+        try:
+            pending_serialized = [_serialize_signal(s) for s in pending_signals]
+            completed_serialized = [_serialize_signal(s) for s in completed_signals]
+            data = {
+                "pending": pending_serialized,
+                "completed": completed_serialized,
+                "signal_counter": signal_id_counter,
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+            }
+            with open(SIGNALS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"save_signals error: {e}")
 
 
 def load_signals():
@@ -191,7 +232,7 @@ def load_signals():
 def send_help_command():
     msg = (
         "دستورات موجود\n====================\n\n"
-        "از دکمه های پایین صفحه استفاده کن یا:\n\n"
+        "از دکمه های پایین استفاده کن یا:\n\n"
         "/stats - آمار کلی\n/status - وضعیت ربات\n/analysis - آخرین تحلیل\n"
         "/today - آمار امروز\n/daily - خلاصه امروز\n/pause - توقف\n/resume - شروع\n/help - راهنما"
     )
@@ -238,21 +279,22 @@ def send_status_command():
 
 def send_analysis_command():
     msg = "آخرین تحلیل\n====================\n\n"
-    if not last_analysis:
-        msg += "هنوز تحلیلی انجام نشده."
-    else:
-        for sym, info in last_analysis.items():
-            conf = info.get('confidence', 0)
-            direction = info.get('direction', '?')
-            status = info.get('status', '?')
-            time_ir = info.get('time_iran', '?')
-            if status == 'signal':
-                status_fa = 'سیگنال'
-            elif status == 'rejected':
-                status_fa = 'رد شده'
-            else:
-                status_fa = 'خطا'
-            msg += f"{sym}\n  اطمینان: {conf}%\n  جهت: {direction}\n  وضعیت: {status_fa}\n  زمان: {time_ir}\n\n"
+    with analysis_lock:
+        if not last_analysis:
+            msg += "هنوز تحلیلی انجام نشده."
+        else:
+            for sym, info in last_analysis.items():
+                conf = info.get('confidence', 0)
+                direction = info.get('direction', '?')
+                status = info.get('status', '?')
+                time_ir = info.get('time_iran', '?')
+                if status == 'signal':
+                    status_fa = 'سیگنال'
+                elif status == 'rejected':
+                    status_fa = 'رد شده'
+                else:
+                    status_fa = 'خطا'
+                msg += f"{sym}\n  اطمینان: {conf}%\n  جهت: {direction}\n  وضعیت: {status_fa}\n  زمان: {time_ir}\n\n"
     msg += f"آستانه: {THRESHOLD}%"
     send_telegram_with_keyboard(msg)
 
@@ -637,7 +679,7 @@ def run_backtest_background():
         backtest_running = False
 
 
-# ================== ANALYZE LIVE (بهینه شده) ==================
+# ================== ANALYZE LIVE ==================
 def analyze_live(symbol):
     try:
         start = time.time()
@@ -688,14 +730,17 @@ def analyze_live(symbol):
         expiry_time = entry_time + timedelta(minutes=30)
 
         direction_tmp = "CALL" if prob[1] > prob[0] else "PUT"
-        last_analysis[symbol] = {
-            "confidence": round(float(confidence), 2),
-            "direction": direction_tmp,
-            "time_utc": entry_time.strftime("%Y-%m-%d %H:%M"),
-            "time_iran": fmt_iran(entry_time),
-            "status": "signal" if confidence >= THRESHOLD else "rejected",
-            "threshold": THRESHOLD,
-        }
+
+        # ✅ با قفل
+        with analysis_lock:
+            last_analysis[symbol] = {
+                "confidence": round(float(confidence), 2),
+                "direction": direction_tmp,
+                "time_utc": entry_time.strftime("%Y-%m-%d %H:%M"),
+                "time_iran": fmt_iran(entry_time),
+                "status": "signal" if confidence >= THRESHOLD else "rejected",
+                "threshold": THRESHOLD,
+            }
 
         elapsed = round(time.time() - start, 2)
         print(f"analyze {symbol}: {confidence:.1f}% {direction_tmp} ({elapsed}s)")
@@ -718,14 +763,15 @@ def analyze_live(symbol):
         print(f"analyze error for {symbol}: {e}")
         import traceback
         traceback.print_exc()
-        last_analysis[symbol] = {
-            "confidence": 0,
-            "direction": "ERROR",
-            "time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
-            "time_iran": fmt_iran(datetime.now(timezone.utc)),
-            "status": "error",
-            "error": str(e)[:200],
-        }
+        with analysis_lock:
+            last_analysis[symbol] = {
+                "confidence": 0,
+                "direction": "ERROR",
+                "time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                "time_iran": fmt_iran(datetime.now(timezone.utc)),
+                "status": "error",
+                "error": str(e)[:200],
+            }
         return None
 
 
@@ -801,18 +847,26 @@ def result_checker_loop():
     while True:
         try:
             now_utc = datetime.now(timezone.utc)
-            for signal in list(pending_signals):
+            # ✅ با قفل برای جلوگیری از race
+            with signal_lock:
+                pending_copy = list(pending_signals)
+
+            for signal in pending_copy:
                 check_time = signal['expiry_time'] + timedelta(minutes=1)
                 if now_utc >= check_time:
                     print(f"Checking result {signal['symbol']}")
                     result = check_signal_result(signal)
                     if result is None:
                         continue
-                    pending_signals.remove(signal)
-                    signal['result'] = result['result']
-                    signal['exit_price'] = result['exit_price']
-                    signal['is_win'] = result['is_win']
-                    completed_signals.append(signal)
+
+                    with signal_lock:
+                        if signal in pending_signals:
+                            pending_signals.remove(signal)
+                        signal['result'] = result['result']
+                        signal['exit_price'] = result['exit_price']
+                        signal['is_win'] = result['is_win']
+                        completed_signals.append(signal)
+
                     send_signal_result(signal)
                     save_signals()
             time.sleep(30)
@@ -833,17 +887,18 @@ def is_active_session():
 
 # ================== BIAS CHECK ==================
 def check_direction_bias(symbol, direction):
-    if symbol not in direction_streak:
-        direction_streak[symbol] = {"direction": direction, "count": 1}
-        return {"streak": 1, "warn": False}
-    info = direction_streak[symbol]
-    if info["direction"] == direction:
-        info["count"] += 1
-    else:
-        direction_streak[symbol] = {"direction": direction, "count": 1}
+    with streak_lock:
+        if symbol not in direction_streak:
+            direction_streak[symbol] = {"direction": direction, "count": 1}
+            return {"streak": 1, "warn": False}
         info = direction_streak[symbol]
-    warn = info["count"] >= MAX_SAME_DIRECTION_STREAK
-    return {"streak": info["count"], "warn": warn}
+        if info["direction"] == direction:
+            info["count"] += 1
+        else:
+            direction_streak[symbol] = {"direction": direction, "count": 1}
+            info = direction_streak[symbol]
+        warn = info["count"] >= MAX_SAME_DIRECTION_STREAK
+        return {"streak": info["count"], "warn": warn}
 
 
 def send_daily_summary():
@@ -927,9 +982,9 @@ def daily_summary_loop():
             time.sleep(60)
 
 
-# ================== LIVE LOOP (موازی) ==================
+# ================== PROCESS SIGNAL (با قفل) ==================
 def process_signal(symbol, result, now_utc, last_signal_time):
-    """پردازش سیگنال (در thread جداگانه)"""
+    """پردازش سیگنال — ✅ با قفل کامل"""
     global signal_id_counter
     try:
         bias_info = check_direction_bias(result['symbol'], result['direction'])
@@ -948,18 +1003,23 @@ def process_signal(symbol, result, now_utc, last_signal_time):
         if bias_info['warn']:
             msg += f"\n\nWARNING: {bias_info['streak']} same-direction signals in a row"
 
-        send_telegram_with_keyboard(msg)
+        # ✅ ارسال غیر بلاک
+        send_telegram_async(msg, reply_markup=get_main_keyboard())
         print(f"Signal sent: {result['symbol']} {result['direction']}")
 
-        signal_id_counter += 1
-        result['id'] = signal_id_counter
-        result['saved_at'] = now_utc
-        pending_signals.append(result)
+        # ✅ با قفل برای pending_signals + counter
+        with signal_lock:
+            signal_id_counter += 1
+            result['id'] = signal_id_counter
+            result['saved_at'] = now_utc
+            pending_signals.append(result)
+
         save_signals()
     except Exception as e:
         print(f"process_signal error: {e}")
 
 
+# ================== LIVE LOOP (موازی، rate-safe) ==================
 def live_loop():
     global live_running
     last_signal_time = {}
@@ -985,8 +1045,8 @@ def live_loop():
                 start_time = time.time()
                 print(f"=== Scanning at {to_iran(now_utc).strftime('%H:%M')} Iran ===")
 
-                # اجرای موازی 4 جفت
-                with ThreadPoolExecutor(max_workers=4) as executor:
+                # ✅ اجرای موازی با حداکثر 2 worker (rate-safe)
+                with ThreadPoolExecutor(max_workers=MAX_PARALLEL_WORKERS) as executor:
                     futures = {
                         executor.submit(analyze_live, sym): (name, sym)
                         for name, sym in SYMBOLS.items()
@@ -1110,13 +1170,14 @@ def analysis_route():
         "threshold": THRESHOLD,
         "symbols": {}
     }
-    for name, sym in SYMBOLS.items():
-        if sym in last_analysis:
-            info = last_analysis[sym].copy()
-            info["name"] = name
-            result["symbols"][name] = info
-        else:
-            result["symbols"][name] = {"name": name, "status": "not_analyzed_yet", "message": "not analyzed yet"}
+    with analysis_lock:
+        for name, sym in SYMBOLS.items():
+            if sym in last_analysis:
+                info = last_analysis[sym].copy()
+                info["name"] = name
+                result["symbols"][name] = info
+            else:
+                result["symbols"][name] = {"name": name, "status": "not_analyzed_yet", "message": "not analyzed yet"}
     return jsonify(result), 200
 
 
