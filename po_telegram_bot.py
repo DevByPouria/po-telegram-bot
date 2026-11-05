@@ -31,7 +31,7 @@ SYMBOLS = {
 INTERVAL = "15min"
 HTF_INTERVAL = "1h"
 OUTPUTSIZE = 5000
-HTF_OUTPUTSIZE = 800
+HTF_OUTPUTSIZE = 5000
 EXPIRY_CANDLES = 2
 THRESHOLD = 70
 N_FOLDS = 6
@@ -43,6 +43,10 @@ LIVE_HTF_SIZE = 250              # ✅ کافی برای EMA50 + buffer
 HTF_CACHE_DURATION = 3900        # 65 دقیقه
 MAX_PARALLEL_WORKERS = 2         # ✅ کاهش به 2 (rate limit)
 HTF_REQUEST_DELAY = 2.0          # ✅ فاصله بین درخواست های HTF
+# ================== BACKTEST DATA (بیشتر) ==================
+BACKTEST_LTF_TOTAL = 10000   # ۱۰,۰۰۰ کندل ۱۵ دقیقه (~۱۰۴ روز)
+BACKTEST_LTF_CHUNK = 5000    # هر درخواست ۵۰۰۰
+BACKTEST_HTF_SIZE = 5000     # HTF: ۵۰۰۰ کندل ۱ ساعته (~۲۰۸ روز)
 
 INITIAL_BANKROLL = 1000.0
 PAYOUT = 0.85
@@ -559,25 +563,118 @@ def purged_walk_forward(X, y, meta, expiry, n_folds):
         oos_y.extend(y_te)
         oos_meta.extend(m_te)
     return np.array(oos_probs), np.array(oos_y), oos_meta, fold_info
+def fetch_extended_ltf_data(td, symbol, total=BACKTEST_LTF_TOTAL, chunk_size=BACKTEST_LTF_CHUNK):
+    """
+    دریافت داده LTF بیشتر با pagination (چند درخواست)
+    total: تعداد کل کندل مورد نیاز
+    chunk_size: تعداد کندل در هر درخواست (حداکثر 5000)
+    """
+    all_chunks = []
+    end_date = None
+    remaining = total
+    attempt = 0
+    max_attempts = 5
 
+    while remaining > 0 and attempt < max_attempts:
+        attempt += 1
+        try:
+            request_size = min(chunk_size, remaining)
+
+            print(f"  [LTF] request {attempt}: {request_size} candles (end_date={end_date or 'now'})")
+
+            if end_date:
+                ts = td.time_series(
+                    symbol=symbol,
+                    interval=INTERVAL,
+                    outputsize=request_size,
+                    end_date=end_date,
+                    timezone="UTC"
+                )
+            else:
+                ts = td.time_series(
+                    symbol=symbol,
+                    interval=INTERVAL,
+                    outputsize=request_size,
+                    timezone="UTC"
+                )
+
+            df = ts.as_pandas()
+
+            if df is None or df.empty:
+                print(f"  [LTF] no more data after {len(all_chunks)} chunks")
+                break
+
+            df = df.rename(columns=str.lower).sort_index()
+            all_chunks.append(df)
+            remaining -= len(df)
+
+            # قدیمی‌ترین کندل این chunk
+            oldest = df.index[0]
+            end_date = (oldest - pd.Timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
+
+            print(f"  [LTF] got {len(df)} candles, total={total - remaining}/{total}")
+
+            # اگه chunk کمتر از request_size بود، یعنی دیگه داده‌ای نیست
+            if len(df) < request_size:
+                print(f"  [LTF] reached end of available data")
+                break
+
+            # فاصله برای rate limit (8 ثانیه بین درخواست‌ها)
+            if remaining > 0:
+                time.sleep(8)
+
+        except Exception as e:
+            print(f"  [LTF] error: {e}")
+            time.sleep(10)
+            attempt += 1
+
+    if not all_chunks:
+        return None
+
+    # ادغام و حذف تکراری‌ها
+    df_combined = pd.concat(all_chunks).sort_index()
+    df_combined = df_combined[~df_combined.index.duplicated(keep='first')]
+    print(f"  [LTF] final: {len(df_combined)} candles total")
+    return df_combined
+    
 def backtest_symbol(name, symbol):
     try:
         print(f"Loading {name}...")
         td = TDClient(apikey=TWELVE_DATA_API_KEY)
-        ts = td.time_series(symbol=symbol, interval=INTERVAL, outputsize=OUTPUTSIZE, timezone="UTC")
-        df = ts.as_pandas()
-        time.sleep(7)
-        ts_h = td.time_series(symbol=symbol, interval=HTF_INTERVAL, outputsize=HTF_OUTPUTSIZE, timezone="UTC")
-        df_h = ts_h.as_pandas()
-        time.sleep(7)
+
+        # ================== LTF: ۱۰,۰۰۰ کندل با pagination ==================
+        print(f"  Fetching LTF ({BACKTEST_LTF_TOTAL} candles via pagination)...")
+        df = fetch_extended_ltf_data(td, symbol)
+        time.sleep(10)
+
         if df is None or df.empty or len(df) < 500:
-            return {"symbol": name, "error": "not enough data"}
+            return {"symbol": name, "error": f"not enough LTF data ({len(df) if df is not None else 0})"}
+
+        # ================== HTF: ۵,۰۰۰ کندل (۱ درخواست) ==================
+        print(f"  Fetching HTF ({HTF_OUTPUTSIZE} candles)...")
+        ts_h = td.time_series(
+            symbol=symbol,
+            interval=HTF_INTERVAL,
+            outputsize=HTF_OUTPUTSIZE,
+            timezone="UTC"
+        )
+        df_h = ts_h.as_pandas()
+        time.sleep(8)
+
+        if df_h is None or df_h.empty:
+            return {"symbol": name, "error": "not enough HTF data"}
+
+        # ================== پردازش ==================
         df = df.rename(columns=str.lower).sort_index()
         df_h = df_h.rename(columns=str.lower).sort_index()
+
         htf_feat = build_htf_features(df_h)
         df = build_ltf_features(df)
         df = merge_htf_ltf(df, htf_feat)
         df = df.dropna()
+
+        print(f"  After processing: {len(df)} rows")
+
         if len(df) < 500:
             return {"symbol": name, "error": "not enough data after filter"}
 
@@ -632,6 +729,7 @@ def backtest_symbol(name, symbol):
             "return_pct": round(ret_pct, 2),
             "final_bankroll": round(bankroll, 2),
             "folds": fold_info,
+            "total_candles": len(df),
         }
     except Exception as e:
         import traceback
