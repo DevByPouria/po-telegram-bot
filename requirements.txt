@@ -6,3 +6,5 @@ numpy
 ta
 twelvedata
 scikit-learn
+lightgbm
+catboost
