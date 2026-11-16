@@ -1210,9 +1210,207 @@ def auto_start():
         send_telegram(f"Auto start error: {e}")
 
 
+# ================== API ENDPOINTS ==================
+
+@app.route('/health')
+def health_route():
+    """JSON health check برای UptimeRobot"""
+    return jsonify({
+        "status": "running",
+        "models": len(trained_models),
+        "live": live_running,
+        "backtest": backtest_running,
+    }), 200
+
+
 @app.route('/')
-def health():
-    return f"Signal Server | Models: {len(trained_models)} | Live: {live_running} | Pending: {len(pending_signals)} | Done: {len(completed_signals)} | Cache: {len(htf_cache)}"
+def dashboard():
+    """داشبورد HTML با همه لینک‌ها"""
+    
+    models_count = len(trained_models)
+    live_status = "🟢 فعال" if live_running else "🔴 غیرفعال"
+    backtest_status = "⏳ در حال اجرا" if backtest_running else "✅ متوقف"
+    session_status = "✅ باز" if is_active_session() else "❌ بسته"
+    pending_count = len(pending_signals)
+    completed_count = len(completed_signals)
+
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="fa" dir="rtl">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Pocket Option Signal Bot</title>
+        <style>
+            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+            body {{
+                font-family: 'Segoe UI', Tahoma, sans-serif;
+                background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+                color: #e2e8f0;
+                min-height: 100vh;
+                padding: 20px;
+            }}
+            .container {{ max-width: 900px; margin: 0 auto; }}
+            h1 {{
+                text-align: center;
+                font-size: 2em;
+                margin-bottom: 10px;
+                color: #38bdf8;
+                text-shadow: 0 2px 10px rgba(56, 189, 248, 0.3);
+            }}
+            .subtitle {{ text-align: center; color: #94a3b8; margin-bottom: 30px; font-size: 0.9em; }}
+            .status-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+                gap: 12px;
+                margin-bottom: 30px;
+            }}
+            .status-card {{
+                background: rgba(30, 41, 59, 0.8);
+                border: 1px solid #334155;
+                border-radius: 12px;
+                padding: 15px;
+                text-align: center;
+            }}
+            .status-card .label {{ font-size: 0.75em; color: #94a3b8; margin-bottom: 5px; }}
+            .status-card .value {{ font-size: 1.3em; font-weight: bold; color: #38bdf8; }}
+            .links-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+                gap: 15px;
+            }}
+            .link-card {{
+                background: rgba(30, 41, 59, 0.6);
+                border: 1px solid #334155;
+                border-radius: 12px;
+                padding: 18px;
+                text-decoration: none;
+                color: #e2e8f0;
+                transition: all 0.2s ease;
+                display: block;
+            }}
+            .link-card:hover {{
+                background: rgba(56, 189, 248, 0.1);
+                border-color: #38bdf8;
+                transform: translateY(-3px);
+                box-shadow: 0 8px 20px rgba(56, 189, 248, 0.2);
+            }}
+            .link-card .title {{
+                font-size: 1.1em;
+                font-weight: bold;
+                color: #38bdf8;
+                margin-bottom: 8px;
+            }}
+            .link-card .desc {{ font-size: 0.85em; color: #94a3b8; line-height: 1.5; }}
+            .link-card .path {{
+                display: inline-block;
+                margin-top: 10px;
+                font-family: monospace;
+                font-size: 0.8em;
+                background: rgba(0, 0, 0, 0.3);
+                padding: 3px 8px;
+                border-radius: 5px;
+                color: #7dd3fc;
+                direction: ltr;
+            }}
+            .link-card.danger:hover {{
+                border-color: #ef4444;
+                background: rgba(239, 68, 68, 0.1);
+                box-shadow: 0 8px 20px rgba(239, 68, 68, 0.2);
+            }}
+            .link-card.success:hover {{
+                border-color: #10b981;
+                background: rgba(16, 185, 129, 0.1);
+                box-shadow: 0 8px 20px rgba(16, 185, 129, 0.2);
+            }}
+            .footer {{ text-align: center; margin-top: 40px; color: #64748b; font-size: 0.8em; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🤖 Pocket Option Signal Bot</h1>
+            <p class="subtitle">داشبورد مدیریت ربات سیگنال‌دهنده</p>
+
+            <div class="status-grid">
+                <div class="status-card">
+                    <div class="label">مدل‌ها</div>
+                    <div class="value">{models_count}</div>
+                </div>
+                <div class="status-card">
+                    <div class="label">Live</div>
+                    <div class="value">{live_status}</div>
+                </div>
+                <div class="status-card">
+                    <div class="label">Backtest</div>
+                    <div class="value">{backtest_status}</div>
+                </div>
+                <div class="status-card">
+                    <div class="label">جلسه بازار</div>
+                    <div class="value">{session_status}</div>
+                </div>
+                <div class="status-card">
+                    <div class="label">در انتظار</div>
+                    <div class="value">{pending_count}</div>
+                </div>
+                <div class="status-card">
+                    <div class="label">تکمیل شده</div>
+                    <div class="value">{completed_count}</div>
+                </div>
+            </div>
+
+            <div class="links-grid">
+                <a href="/analysis" class="link-card">
+                    <div class="title">🔍 آخرین تحلیل</div>
+                    <div class="desc">آخرین تحلیل ML برای هر جفت‌ارز (اطمینان، جهت، وضعیت)</div>
+                    <span class="path">/analysis</span>
+                </a>
+
+                <a href="/status" class="link-card">
+                    <div class="title">📊 وضعیت ربات</div>
+                    <div class="desc">وضعیت کامل ربات شامل مدل‌ها، Live، Backtest</div>
+                    <span class="path">/status</span>
+                </a>
+
+                <a href="/stats" class="link-card">
+                    <div class="title">📈 آمار سیگنال‌ها</div>
+                    <div class="desc">آمار کامل سیگنال‌ها، برد، باخت و وین ریت</div>
+                    <span class="path">/stats</span>
+                </a>
+
+                <a href="/health" class="link-card">
+                    <div class="title">💓 Health Check</div>
+                    <div class="desc">JSON وضعیت برای UptimeRobot</div>
+                    <span class="path">/health</span>
+                </a>
+
+                <a href="/start_live" class="link-card success">
+                    <div class="title">▶️ شروع Live</div>
+                    <div class="desc">فعال‌سازی حالت Live و شروع ارسال سیگنال‌ها</div>
+                    <span class="path">/start_live</span>
+                </a>
+
+                <a href="/stop_live" class="link-card danger">
+                    <div class="title">⏹️ توقف Live</div>
+                    <div class="desc">توقف موقت ارسال سیگنال‌ها</div>
+                    <span class="path">/stop_live</span>
+                </a>
+
+                <a href="/backtest" class="link-card">
+                    <div class="title">🔄 اجرای Backtest</div>
+                    <div class="desc">شروع بک‌تست جدید (۵-۴۰ دقیقه)</div>
+                    <span class="path">/backtest</span>
+                </a>
+            </div>
+
+            <div class="footer">
+                <p>Pocket Option Signal Bot &copy; 2026</p>
+                <p>Random Forest ML + TwelveData</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return html
 
 
 @app.route('/backtest', methods=['GET'])
