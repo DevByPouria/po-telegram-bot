@@ -34,7 +34,7 @@ OUTPUTSIZE = 5000
 HTF_OUTPUTSIZE = 5000
 EXPIRY_CANDLES = 2
 THRESHOLD = 70
-N_FOLDS = 6
+N_FOLDS = 4
 MIN_TRAIN_RATIO = 0.4
 
 # ================== OPTIMIZATION ==================
@@ -44,7 +44,7 @@ HTF_CACHE_DURATION = 3900        # 65 دقیقه
 MAX_PARALLEL_WORKERS = 2         # ✅ کاهش به 2 (rate limit)
 HTF_REQUEST_DELAY = 2.0          # ✅ فاصله بین درخواست های HTF
 # ================== BACKTEST DATA (بیشتر) ==================
-BACKTEST_LTF_TOTAL = 10000   # ۱۰,۰۰۰ کندل ۱۵ دقیقه (~۱۰۴ روز)
+BACKTEST_LTF_TOTAL = 5000   # ۱۰,۰۰۰ کندل ۱۵ دقیقه (~۱۰۴ روز)
 BACKTEST_LTF_CHUNK = 5000    # هر درخواست ۵۰۰۰
 BACKTEST_HTF_SIZE = 5000     # HTF: ۵۰۰۰ کندل ۱ ساعته (~۲۰۸ روز)
 
