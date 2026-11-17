@@ -11,8 +11,12 @@ import pandas as pd
 import numpy as np
 import ta
 from twelvedata import TDClient
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from lightgbm import LGBMClassifier
 
 app = Flask(__name__)
 
@@ -33,20 +37,21 @@ HTF_INTERVAL = "1h"
 OUTPUTSIZE = 5000
 HTF_OUTPUTSIZE = 5000
 EXPIRY_CANDLES = 2
-THRESHOLD = 70
+THRESHOLD = 65
 N_FOLDS = 4
 MIN_TRAIN_RATIO = 0.4
 
 # ================== OPTIMIZATION ==================
-LIVE_LTF_SIZE = 450              # ✅ کافی برای EMA200 + buffer
-LIVE_HTF_SIZE = 250              # ✅ کافی برای EMA50 + buffer
+LIVE_LTF_SIZE = 450              # کافی برای EMA200 + buffer
+LIVE_HTF_SIZE = 250              # کافی برای EMA50 + buffer
 HTF_CACHE_DURATION = 3900        # 65 دقیقه
-MAX_PARALLEL_WORKERS = 2         # ✅ کاهش به 2 (rate limit)
-HTF_REQUEST_DELAY = 2.0          # ✅ فاصله بین درخواست های HTF
-# ================== BACKTEST DATA (بیشتر) ==================
-BACKTEST_LTF_TOTAL = 5000   # ۱۰,۰۰۰ کندل ۱۵ دقیقه (~۱۰۴ روز)
-BACKTEST_LTF_CHUNK = 5000    # هر درخواست ۵۰۰۰
-BACKTEST_HTF_SIZE = 5000     # HTF: ۵۰۰۰ کندل ۱ ساعته (~۲۰۸ روز)
+MAX_PARALLEL_WORKERS = 3         # بهینه‌شده برای ۴ جفت‌ارز
+HTF_REQUEST_DELAY = 1.5
+
+# ================== BACKTEST DATA ==================
+BACKTEST_LTF_TOTAL = 5000
+BACKTEST_LTF_CHUNK = 5000
+BACKTEST_HTF_SIZE = 5000
 
 INITIAL_BANKROLL = 1000.0
 PAYOUT = 0.85
@@ -73,33 +78,140 @@ last_update_id = 0
 
 SIGNALS_FILE = "signals_data.json"
 
-# ================== LOCKS ==================
+# ================== THREADS & LOCKS ==================
+live_thread = None
+checker_thread = None
+summary_thread = None
+
+live_control_lock = threading.Lock()    # قفل اختصاصی کنترل استارت/استاپ تردها
 htf_cache = {}
 htf_cache_lock = threading.Lock()       # قفل خواندن کش
-htf_fetch_lock = threading.Lock()       # ✅ قفل درخواست جدید HTF
-signal_lock = threading.Lock()          # ✅ قفل pending_signals + counter
-analysis_lock = threading.Lock()        # ✅ قفل last_analysis
-save_lock = threading.Lock()            # ✅ قفل save_signals
-streak_lock = threading.Lock()          # ✅ قفل direction_streak
+htf_fetch_lock = threading.Lock()       # قفل درخواست جدید HTF
+signal_lock = threading.Lock()          # قفل pending_signals + counter
+analysis_lock = threading.Lock()        # قفل last_analysis
+save_lock = threading.Lock()            # قفل save_signals
+streak_lock = threading.Lock()          # قفل direction_streak
 
 
-# ================== HTF CACHE (با قفل کامل) ==================
+# ================== HELPER: DROP INCOMPLETE CANDLE ==================
+def drop_incomplete_candle(df, interval_minutes=15):
+    """
+    حذف کندل آخر فقط در صورتی که بر اساس زمان واقعی (UTC) هنوز بسته نشده باشد.
+    (توجه: TwelveData در حالت پیش‌فرض timestamp زمان باز شدن کندل را برمی‌گرداند)
+    """
+    if df is None or df.empty:
+        return df
+    now_utc = datetime.now(timezone.utc)
+    last_idx = df.index[-1]
+    if last_idx.tzinfo is None:
+        last_idx = last_idx.tz_localize(timezone.utc)
+    if now_utc < last_idx + timedelta(minutes=interval_minutes):
+        return df.iloc[:-1]
+    return df
+
+
+# ================== TRUE DIVERSE ENSEMBLE MODEL ==================
+class ConsensusEnsembleModel:
+    """
+    ترکیب ۳ خانواده کاملاً متفاوت یادگیری ماشین با قانون اجماع:
+    1. LightGBM (درخت تصمیم تقویتی)
+    2. MLPClassifier (شبکه عصبی چندلایه بهینه‌شده برای سرعت و جلوگیری از Underfit)
+    3. LogisticRegression با C=2.0 (مدل خطی بدون انقباض شدید)
+    """
+    def __init__(self, threshold=0.65):
+        self.threshold = threshold
+
+        # ۱. خانواده درخت تصمیم: LightGBM
+        self.model_lgb = LGBMClassifier(
+            n_estimators=150,
+            learning_rate=0.05,
+            max_depth=4,
+            num_leaves=15,
+            subsample_for_bin=2000,
+            random_state=42,
+            n_jobs=1,
+            verbose=-1
+        )
+
+        # ۲. خانواده شبکه عصبی: MLP بهینه‌شده برای سرعت روی Render و جلوگیری از Underfitting
+        self.model_mlp = make_pipeline(
+            StandardScaler(),
+            MLPClassifier(
+                hidden_layer_sizes=(32, 16),
+                activation='relu',
+                alpha=0.02,
+                max_iter=300,
+                early_stopping=True,
+                validation_fraction=0.15,
+                n_iter_no_change=10,
+                random_state=42
+            )
+        )
+
+        # ۳. خانواده خطی: LogisticRegression با C=2.0
+        self.model_lr = make_pipeline(
+            StandardScaler(),
+            LogisticRegression(C=2.0, max_iter=1000, random_state=42)
+        )
+
+    def fit(self, X, y):
+        self.model_lgb.fit(X, y)
+        self.model_mlp.fit(X, y)
+        self.model_lr.fit(X, y)
+        return self
+
+    def predict_proba(self, X):
+        """
+        برگرداندن احتمال اجماع. در صورت عدم توافق ۳ مدل، خروجی [0.5, 0.5] برمی‌گردد.
+        """
+        p_lgb = self.model_lgb.predict_proba(X)
+        p_mlp = self.model_mlp.predict_proba(X)
+        p_lr = self.model_lr.predict_proba(X)
+
+        final_probs = np.full((len(X), 2), 0.5)
+
+        for i in range(len(X)):
+            # بررسی اجماع برای CALL (ستون 1)
+            if p_lgb[i, 1] >= self.threshold and p_mlp[i, 1] >= self.threshold and p_lr[i, 1] >= self.threshold:
+                avg_call = (p_lgb[i, 1] + p_mlp[i, 1] + p_lr[i, 1]) / 3.0
+                final_probs[i] = [1.0 - avg_call, avg_call]
+
+            # بررسی اجماع برای PUT (ستون 0)
+            elif p_lgb[i, 0] >= self.threshold and p_mlp[i, 0] >= self.threshold and p_lr[i, 0] >= self.threshold:
+                avg_put = (p_lgb[i, 0] + p_mlp[i, 0] + p_lr[i, 0]) / 3.0
+                final_probs[i] = [avg_put, 1.0 - avg_put]
+
+        return final_probs
+
+    def predict(self, X):
+        """
+        همگام‌سازی کامل با predict_proba:
+        خروجی: 1 برای CALL، 0 برای PUT، و -1 برای عدم اجماع (NO_TRADE)
+        """
+        probs = self.predict_proba(X)
+        preds = np.full(len(X), -1)
+        for i in range(len(X)):
+            if probs[i, 1] >= self.threshold:
+                preds[i] = 1
+            elif probs[i, 0] >= self.threshold:
+                preds[i] = 0
+        return preds
+
+
+# ================== HTF CACHE (با پاکسازی خودکار) ==================
 def get_htf_data(symbol):
-    """
-    دریافت داده 1h از کش یا درخواست جدید
-    ✅ با قفل کامل برای جلوگیری از rate limit
-    """
-    # چک کش
     with htf_cache_lock:
         now = time.time()
+        expired = [k for k, (t, _) in htf_cache.items() if now - t >= HTF_CACHE_DURATION]
+        for k in expired:
+            htf_cache.pop(k, None)
+
         if symbol in htf_cache:
             cache_time, cache_data = htf_cache[symbol]
             if now - cache_time < HTF_CACHE_DURATION:
                 return cache_data
 
-    # درخواست جدید — با قفل کامل
     with htf_fetch_lock:
-        # چک دوباره (شاید thread دیگه درخواست داده)
         with htf_cache_lock:
             now = time.time()
             if symbol in htf_cache:
@@ -145,7 +257,6 @@ def send_telegram(message, reply_markup=None):
 
 
 def send_telegram_async(message, reply_markup=None):
-    """✅ ارسال در thread جداگانه (غیر بلاک)"""
     threading.Thread(
         target=send_telegram,
         args=(message, reply_markup),
@@ -180,7 +291,7 @@ def fmt_iran(dt):
     return to_iran(dt).strftime("%H:%M")
 
 
-# ================== SAVE / LOAD ==================
+# ================== ATOMIC SAVE / LOAD ==================
 def _serialize_signal(s):
     s_copy = s.copy()
     for key in ['entry_time', 'expiry_time', 'saved_at']:
@@ -200,19 +311,23 @@ def _deserialize_signal(s):
 
 
 def save_signals():
-    """✅ با قفل"""
     with save_lock:
         try:
-            pending_serialized = [_serialize_signal(s) for s in pending_signals]
-            completed_serialized = [_serialize_signal(s) for s in completed_signals]
+            with signal_lock:
+                pending_serialized = [_serialize_signal(s) for s in pending_signals]
+                completed_serialized = [_serialize_signal(s) for s in completed_signals]
+                counter_val = signal_id_counter
+
             data = {
                 "pending": pending_serialized,
                 "completed": completed_serialized,
-                "signal_counter": signal_id_counter,
+                "signal_counter": counter_val,
                 "saved_at": datetime.now(timezone.utc).isoformat(),
             }
-            with open(SIGNALS_FILE, "w", encoding="utf-8") as f:
+            temp_file = SIGNALS_FILE + ".tmp"
+            with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(temp_file, SIGNALS_FILE)
         except Exception as e:
             print(f"save_signals error: {e}")
 
@@ -224,12 +339,49 @@ def load_signals():
             return
         with open(SIGNALS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        pending_signals = [_deserialize_signal(s) for s in data.get("pending", [])]
-        completed_signals = [_deserialize_signal(s) for s in data.get("completed", [])]
-        signal_id_counter = data.get("signal_counter", 0)
+        with signal_lock:
+            pending_signals = [_deserialize_signal(s) for s in data.get("pending", [])]
+            completed_signals = [_deserialize_signal(s) for s in data.get("completed", [])]
+            signal_id_counter = data.get("signal_counter", 0)
         print(f"Signals loaded: {len(pending_signals)} pending, {len(completed_signals)} completed")
     except Exception as e:
         print(f"load_signals error: {e}")
+
+
+# ================== THREAD SAFE START / STOP HELPERS ==================
+def start_live_services():
+    global live_running, live_thread, checker_thread, summary_thread
+    with live_control_lock:
+        if not trained_models:
+            return False, "مدل‌ها هنوز آموزش ندیده‌اند."
+
+        already_active = live_running
+        live_running = True
+
+        if live_thread is None or not live_thread.is_alive():
+            live_thread = threading.Thread(target=live_loop, daemon=True)
+            live_thread.start()
+
+        if checker_thread is None or not checker_thread.is_alive():
+            checker_thread = threading.Thread(target=result_checker_loop, daemon=True)
+            checker_thread.start()
+
+        if summary_thread is None or not summary_thread.is_alive():
+            summary_thread = threading.Thread(target=daily_summary_loop, daemon=True)
+            summary_thread.start()
+
+        if already_active:
+            return True, "ربات از قبل فعال بود."
+        return True, "ربات با موفقیت فعال شد."
+
+
+def stop_live_services():
+    global live_running
+    with live_control_lock:
+        if not live_running:
+            return False, "ربات از قبل متوقف بود."
+        live_running = False
+        return True, "ربات موقتا متوقف شد."
 
 
 # ================== TELEGRAM COMMANDS ==================
@@ -244,10 +396,14 @@ def send_help_command():
 
 
 def send_stats_command():
-    total = len(completed_signals)
-    wins = sum(1 for s in completed_signals if s.get('is_win') is True)
-    losses = sum(1 for s in completed_signals if s.get('is_win') is False)
-    ties = sum(1 for s in completed_signals if s.get('is_win') is None)
+    with signal_lock:
+        comp_copy = list(completed_signals)
+        pend_len = len(pending_signals)
+
+    total = len(comp_copy)
+    wins = sum(1 for s in comp_copy if s.get('is_win') is True)
+    losses = sum(1 for s in comp_copy if s.get('is_win') is False)
+    ties = sum(1 for s in comp_copy if s.get('is_win') is None)
     decided = wins + losses
     wr = round(wins / decided * 100, 1) if decided > 0 else 0
 
@@ -255,11 +411,11 @@ def send_stats_command():
     msg += f"کل سیگنال: {total}\nبرد: {wins} | باخت: {losses}"
     if ties > 0:
         msg += f" | مساوی: {ties}"
-    msg += f"\nوین ریت: {wr}%\nدر انتظار: {len(pending_signals)}\n\n"
+    msg += f"\nوین ریت: {wr}%\nدر انتظار: {pend_len}\n\n"
 
-    if completed_signals:
+    if comp_copy:
         msg += "آخرین 5 سیگنال:\n"
-        for s in completed_signals[-5:]:
+        for s in comp_copy[-5:]:
             emoji = "برد" if s.get('is_win') is True else ("باخت" if s.get('is_win') is False else "مساوی")
             msg += f"  {s['symbol']} {s['direction']} - {emoji}\n"
 
@@ -268,7 +424,7 @@ def send_stats_command():
 
 def send_status_command():
     msg = "وضعیت ربات\n====================\n\n"
-    msg += f"مدل ها: {len(trained_models)}\n"
+    msg += f"مدل ها: {len(trained_models)} (LGBM + MLP + LR)\n"
     msg += f"Live: {'فعال' if live_running else 'غیرفعال'}\n"
     msg += f"Backtest: {'در حال اجرا' if backtest_running else 'متوقف'}\n"
     msg += f"در انتظار: {len(pending_signals)}\n"
@@ -295,7 +451,7 @@ def send_analysis_command():
                 if status == 'signal':
                     status_fa = 'سیگنال'
                 elif status == 'rejected':
-                    status_fa = 'رد شده'
+                    status_fa = 'رد شده (عدم اجماع)'
                 else:
                     status_fa = 'خطا'
                 msg += f"{sym}\n  اطمینان: {conf}%\n  جهت: {direction}\n  وضعیت: {status_fa}\n  زمان: {time_ir}\n\n"
@@ -306,8 +462,11 @@ def send_analysis_command():
 def send_today_command():
     now_iran = to_iran(datetime.now(timezone.utc))
     today_start = now_iran.replace(hour=0, minute=0, second=0, microsecond=0)
+    with signal_lock:
+        comp_copy = list(completed_signals)
+
     today_signals = []
-    for s in completed_signals:
+    for s in comp_copy:
         try:
             if to_iran(s['entry_time']) >= today_start:
                 today_signals.append(s)
@@ -347,7 +506,6 @@ def send_today_command():
 
 
 def handle_command(update):
-    global live_running
     try:
         msg = update.get("message") or update.get("edited_message")
         if not msg:
@@ -374,20 +532,11 @@ def handle_command(update):
         elif text == "راهنما" or cmd == "/help":
             send_help_command()
         elif text == "توقف" or cmd in ["/pause", "/stop"]:
-            if live_running:
-                live_running = False
-                send_telegram_with_keyboard("ربات موقتا متوقف شد.")
-            else:
-                send_telegram_with_keyboard("ربات از قبل متوقف بود.")
+            _, status_msg = stop_live_services()
+            send_telegram_with_keyboard(status_msg)
         elif text == "شروع" or cmd in ["/resume", "/start"]:
-            if not trained_models:
-                send_telegram_with_keyboard("مدل ها آموزش ندیدن.")
-            elif live_running:
-                send_telegram_with_keyboard("ربات فعاله.")
-            else:
-                live_running = True
-                threading.Thread(target=live_loop, daemon=True).start()
-                send_telegram_with_keyboard("ربات دوباره فعال شد.")
+            _, status_msg = start_live_services()
+            send_telegram_with_keyboard(status_msg)
         else:
             send_telegram_with_keyboard(f"دستور ناشناخته: {text}")
     except Exception as e:
@@ -550,25 +699,36 @@ def purged_walk_forward(X, y, meta, expiry, n_folds):
         m_te = meta[test_start:test_end]
         if len(X_te) < 20:
             continue
-        model = RandomForestClassifier(
-            n_estimators=200, max_depth=10,
-            min_samples_split=20, min_samples_leaf=10,
-            random_state=42, n_jobs=-1
-        )
+
+        model = ConsensusEnsembleModel(threshold=THRESHOLD / 100.0)
         model.fit(X_tr, y_tr)
+
         probs = model.predict_proba(X_te)
-        acc = accuracy_score(y_te, model.predict(X_te))
-        fold_info.append(round(acc * 100, 2))
+        preds = model.predict(X_te)
+
+        # لاگ کردن میزان مشارکت هر مدل برای تشخیص Underfit احتمالی MLP
+        p_lgb = model.model_lgb.predict_proba(X_te)
+        p_mlp = model.model_mlp.predict_proba(X_te)
+        p_lr = model.model_lr.predict_proba(X_te)
+        th = THRESHOLD / 100.0
+        lgb_hits = ((p_lgb[:, 1] >= th) | (p_lgb[:, 0] >= th)).sum()
+        mlp_hits = ((p_mlp[:, 1] >= th) | (p_mlp[:, 0] >= th)).sum()
+        lr_hits = ((p_lr[:, 1] >= th) | (p_lr[:, 0] >= th)).sum()
+        print(f"  [Fold {fold+1}] Hits >= {THRESHOLD}% | LGB: {lgb_hits}, MLP: {mlp_hits}, LR: {lr_hits} (out of {len(X_te)})")
+
+        valid_mask = (preds != -1)
+        if valid_mask.sum() > 0:
+            acc = accuracy_score(y_te[valid_mask], preds[valid_mask])
+            fold_info.append(f"{round(acc * 100, 1)}% ({valid_mask.sum()})")
+        else:
+            fold_info.append("0% (0)")
+
         oos_probs.extend(probs)
         oos_y.extend(y_te)
         oos_meta.extend(m_te)
     return np.array(oos_probs), np.array(oos_y), oos_meta, fold_info
+
 def fetch_extended_ltf_data(td, symbol, total=BACKTEST_LTF_TOTAL, chunk_size=BACKTEST_LTF_CHUNK):
-    """
-    دریافت داده LTF بیشتر با pagination (چند درخواست)
-    total: تعداد کل کندل مورد نیاز
-    chunk_size: تعداد کندل در هر درخواست (حداکثر 5000)
-    """
     all_chunks = []
     end_date = None
     remaining = total
@@ -579,7 +739,6 @@ def fetch_extended_ltf_data(td, symbol, total=BACKTEST_LTF_TOTAL, chunk_size=BAC
         attempt += 1
         try:
             request_size = min(chunk_size, remaining)
-
             print(f"  [LTF] request {attempt}: {request_size} candles (end_date={end_date or 'now'})")
 
             if end_date:
@@ -608,18 +767,15 @@ def fetch_extended_ltf_data(td, symbol, total=BACKTEST_LTF_TOTAL, chunk_size=BAC
             all_chunks.append(df)
             remaining -= len(df)
 
-            # قدیمی‌ترین کندل این chunk
             oldest = df.index[0]
             end_date = (oldest - pd.Timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
 
             print(f"  [LTF] got {len(df)} candles, total={total - remaining}/{total}")
 
-            # اگه chunk کمتر از request_size بود، یعنی دیگه داده‌ای نیست
             if len(df) < request_size:
                 print(f"  [LTF] reached end of available data")
                 break
 
-            # فاصله برای rate limit (8 ثانیه بین درخواست‌ها)
             if remaining > 0:
                 time.sleep(8)
 
@@ -631,18 +787,16 @@ def fetch_extended_ltf_data(td, symbol, total=BACKTEST_LTF_TOTAL, chunk_size=BAC
     if not all_chunks:
         return None
 
-    # ادغام و حذف تکراری‌ها
     df_combined = pd.concat(all_chunks).sort_index()
     df_combined = df_combined[~df_combined.index.duplicated(keep='first')]
     print(f"  [LTF] final: {len(df_combined)} candles total")
     return df_combined
-    
+
 def backtest_symbol(name, symbol):
     try:
         print(f"Loading {name}...")
         td = TDClient(apikey=TWELVE_DATA_API_KEY)
 
-        # ================== LTF: ۱۰,۰۰۰ کندل با pagination ==================
         print(f"  Fetching LTF ({BACKTEST_LTF_TOTAL} candles via pagination)...")
         df = fetch_extended_ltf_data(td, symbol)
         time.sleep(10)
@@ -650,7 +804,6 @@ def backtest_symbol(name, symbol):
         if df is None or df.empty or len(df) < 500:
             return {"symbol": name, "error": f"not enough LTF data ({len(df) if df is not None else 0})"}
 
-        # ================== HTF: ۵,۰۰۰ کندل (۱ درخواست) ==================
         print(f"  Fetching HTF ({HTF_OUTPUTSIZE} candles)...")
         ts_h = td.time_series(
             symbol=symbol,
@@ -664,9 +817,12 @@ def backtest_symbol(name, symbol):
         if df_h is None or df_h.empty:
             return {"symbol": name, "error": "not enough HTF data"}
 
-        # ================== پردازش ==================
         df = df.rename(columns=str.lower).sort_index()
         df_h = df_h.rename(columns=str.lower).sort_index()
+
+        # حذف شرطی آخرین کندل فقط در صورتی که واقعاً در حال تشکیل باشد
+        df = drop_incomplete_candle(df, interval_minutes=15)
+        df_h = drop_incomplete_candle(df_h, interval_minutes=60)
 
         htf_feat = build_htf_features(df_h)
         df = build_ltf_features(df)
@@ -712,11 +868,7 @@ def backtest_symbol(name, symbol):
             days = 1
         sig_per_day = round(signals / days, 1)
 
-        final_model = RandomForestClassifier(
-            n_estimators=200, max_depth=10,
-            min_samples_split=20, min_samples_leaf=10,
-            random_state=42, n_jobs=-1
-        )
+        final_model = ConsensusEnsembleModel(threshold=THRESHOLD / 100.0)
         final_model.fit(X, y)
         trained_models[name] = final_model
 
@@ -743,14 +895,15 @@ def run_backtest_background():
     backtest_running = True
     try:
         send_telegram(
-            "BACKTEST STARTED\n\n"
-            "4 pairs selected\nExpiry: 30 min\n"
-            f"Threshold: {THRESHOLD}%\n\nTakes 5-8 minutes..."
+            "BACKTEST STARTED (Diverse 3-Model Ensemble)\n\n"
+            "Models: LightGBM + MLP + LR(C=2.0)\nExpiry: 30 min\n"
+            f"Threshold: {THRESHOLD}%\n\nTakes 8-12 minutes..."
         )
 
         results = []
         for name, sym in SYMBOLS.items():
             r = backtest_symbol(name, sym)
+            gc.collect()
             if "error" in r:
                 send_telegram(f"ERROR {name}: {r['error']}")
                 continue
@@ -759,7 +912,7 @@ def run_backtest_background():
                 f"====================\n{r['symbol']}\n====================\n\n"
                 f"Win Rate: {r['wr']}%\nSignals: {r['signals']} (~{r['signals_per_day']}/day)\n"
                 f"Bank: $1000 -> ${r['final_bankroll']}\nReturn: {r['return_pct']}%\n"
-                f"Folds: {r['folds']}"
+                f"Folds (WR & Count): {r['folds']}"
             )
             send_telegram(msg)
 
@@ -781,7 +934,6 @@ def run_backtest_background():
 def analyze_live(symbol):
     try:
         start = time.time()
-        # 1. دریافت 15min
         td = TDClient(apikey=TWELVE_DATA_API_KEY)
         ts = td.time_series(symbol=symbol, interval=INTERVAL, outputsize=LIVE_LTF_SIZE, timezone="UTC")
         df = ts.as_pandas()
@@ -789,7 +941,6 @@ def analyze_live(symbol):
             print(f"analyze {symbol}: not enough data ({len(df) if df is not None else 0})")
             return None
 
-        # 2. دریافت 1h از کش
         df_h = get_htf_data(symbol)
         if df_h is None or df_h.empty:
             print(f"analyze {symbol}: no HTF data")
@@ -797,6 +948,9 @@ def analyze_live(symbol):
 
         df = df.rename(columns=str.lower).sort_index()
         df_h = df_h.rename(columns=str.lower).sort_index()
+
+        # حذف شرطی کندل ناقص فعلی بر اساس زمان واقعی
+        df = drop_incomplete_candle(df, interval_minutes=15)
 
         htf_feat = build_htf_features(df_h)
         df = build_ltf_features(df)
@@ -827,9 +981,11 @@ def analyze_live(symbol):
         entry_time = entry_time + timedelta(minutes=15)
         expiry_time = entry_time + timedelta(minutes=30)
 
-        direction_tmp = "CALL" if prob[1] > prob[0] else "PUT"
+        if confidence < THRESHOLD:
+            direction_tmp = "NO_CONSENSUS"
+        else:
+            direction_tmp = "CALL" if prob[1] > prob[0] else "PUT"
 
-        # ✅ با قفل
         with analysis_lock:
             last_analysis[symbol] = {
                 "confidence": round(float(confidence), 2),
@@ -882,14 +1038,21 @@ def check_signal_result(signal):
             return None
         df = df.rename(columns=str.lower).sort_index()
 
+        # حذف شرطی کندل آخر فقط اگر واقعاً در حال تشکیل باشد (جلوگیری از باگ مرزی)
+        df = drop_incomplete_candle(df, interval_minutes=15)
+        if df.empty:
+            return None
+
         expiry_time = signal['expiry_time']
         if expiry_time.tzinfo is None:
             expiry_time = expiry_time.replace(tzinfo=timezone.utc)
         if df.index.tzinfo is None:
             df.index = df.index.tz_localize(timezone.utc)
 
-        valid_candles = df[df.index <= expiry_time]
-        if valid_candles.empty:
+        # کندل انقضا کندلی است که در expiry_time - 15min باز شده و در expiry_time بسته شده است
+        target_candle_open = expiry_time - timedelta(minutes=15)
+        valid_candles = df[df.index <= target_candle_open]
+        if valid_candles.empty or valid_candles.index[-1] < target_candle_open:
             return None
 
         exit_price = float(valid_candles.iloc[-1]['close'])
@@ -924,10 +1087,13 @@ def send_signal_result(signal):
         f"Price In: {signal['entry_price']:.5f}\nPrice Out: {signal['exit_price']:.5f}\n"
     )
 
-    total = len(completed_signals)
-    wins = sum(1 for s in completed_signals if s.get('is_win') is True)
-    losses = sum(1 for s in completed_signals if s.get('is_win') is False)
-    ties = sum(1 for s in completed_signals if s.get('is_win') is None)
+    with signal_lock:
+        comp_copy = list(completed_signals)
+
+    total = len(comp_copy)
+    wins = sum(1 for s in comp_copy if s.get('is_win') is True)
+    losses = sum(1 for s in comp_copy if s.get('is_win') is False)
+    ties = sum(1 for s in comp_copy if s.get('is_win') is None)
 
     if total > 0:
         decided = wins + losses
@@ -941,32 +1107,34 @@ def send_signal_result(signal):
 
 
 def result_checker_loop():
-    global pending_signals, completed_signals
     while True:
         try:
             now_utc = datetime.now(timezone.utc)
-            # ✅ با قفل برای جلوگیری از race
             with signal_lock:
                 pending_copy = list(pending_signals)
 
             for signal in pending_copy:
-                check_time = signal['expiry_time'] + timedelta(minutes=1)
+                check_time = signal['expiry_time'] + timedelta(minutes=3)
                 if now_utc >= check_time:
                     print(f"Checking result {signal['symbol']}")
                     result = check_signal_result(signal)
                     if result is None:
                         continue
 
+                    already_processed = False
                     with signal_lock:
                         if signal in pending_signals:
                             pending_signals.remove(signal)
-                        signal['result'] = result['result']
-                        signal['exit_price'] = result['exit_price']
-                        signal['is_win'] = result['is_win']
-                        completed_signals.append(signal)
+                            signal['result'] = result['result']
+                            signal['exit_price'] = result['exit_price']
+                            signal['is_win'] = result['is_win']
+                            completed_signals.append(signal)
+                        else:
+                            already_processed = True
 
-                    send_signal_result(signal)
-                    save_signals()
+                    if not already_processed:
+                        send_signal_result(signal)
+                        save_signals()
             time.sleep(30)
         except Exception as e:
             print(f"result_checker error: {e}")
@@ -1003,8 +1171,11 @@ def send_daily_summary():
     now_iran = to_iran(datetime.now(timezone.utc))
     today_start = now_iran.replace(hour=0, minute=0, second=0, microsecond=0)
 
+    with signal_lock:
+        comp_copy = list(completed_signals)
+
     today_signals = []
-    for s in completed_signals:
+    for s in comp_copy:
         try:
             if to_iran(s['entry_time']) >= today_start:
                 today_signals.append(s)
@@ -1080,9 +1251,8 @@ def daily_summary_loop():
             time.sleep(60)
 
 
-# ================== PROCESS SIGNAL (با قفل) ==================
+# ================== PROCESS SIGNAL ==================
 def process_signal(symbol, result, now_utc, last_signal_time):
-    """پردازش سیگنال — ✅ با قفل کامل"""
     global signal_id_counter
     try:
         bias_info = check_direction_bias(result['symbol'], result['direction'])
@@ -1101,11 +1271,9 @@ def process_signal(symbol, result, now_utc, last_signal_time):
         if bias_info['warn']:
             msg += f"\n\nWARNING: {bias_info['streak']} same-direction signals in a row"
 
-        # ✅ ارسال غیر بلاک
         send_telegram_async(msg, reply_markup=get_main_keyboard())
         print(f"Signal sent: {result['symbol']} {result['direction']}")
 
-        # ✅ با قفل برای pending_signals + counter
         with signal_lock:
             signal_id_counter += 1
             result['id'] = signal_id_counter
@@ -1117,9 +1285,8 @@ def process_signal(symbol, result, now_utc, last_signal_time):
         print(f"process_signal error: {e}")
 
 
-# ================== LIVE LOOP (موازی، rate-safe) ==================
+# ================== LIVE LOOP ==================
 def live_loop():
-    global live_running
     last_signal_time = {}
 
     while live_running:
@@ -1132,7 +1299,6 @@ def live_loop():
                 time.sleep(60)
                 continue
 
-            # پنجره اسکن: 5-15 ثانیه بعد از بسته شدن کندل
             if minute % 15 == 0 and 5 <= second <= 15:
                 slot_key = now_utc.strftime("%Y%m%d%H%M")
                 if slot_key == last_signal_time.get("_slot"):
@@ -1143,7 +1309,6 @@ def live_loop():
                 start_time = time.time()
                 print(f"=== Scanning at {to_iran(now_utc).strftime('%H:%M')} Iran ===")
 
-                # ✅ اجرای موازی با حداکثر 2 worker (rate-safe)
                 with ThreadPoolExecutor(max_workers=MAX_PARALLEL_WORKERS) as executor:
                     futures = {
                         executor.submit(analyze_live, sym): (name, sym)
@@ -1169,7 +1334,7 @@ def live_loop():
 
 # ================== AUTO START ==================
 def auto_start():
-    global live_running, auto_start_done
+    global auto_start_done
     time.sleep(15)
 
     print("=" * 50)
@@ -1178,7 +1343,7 @@ def auto_start():
 
     try:
         load_signals()
-        send_telegram_with_keyboard("AUTO START\n\nPreparing bot...")
+        send_telegram_with_keyboard("AUTO START\n\nPreparing bot (Diverse 3-Model Consensus)...")
 
         if not trained_models:
             print("No models. Starting backtest...")
@@ -1187,21 +1352,19 @@ def auto_start():
                 time.sleep(5)
             print(f"Backtest done. {len(trained_models)} models trained.")
 
-        if trained_models and not live_running:
-            live_running = True
-            threading.Thread(target=live_loop, daemon=True).start()
-            threading.Thread(target=result_checker_loop, daemon=True).start()
-            threading.Thread(target=daily_summary_loop, daemon=True).start()
+        if trained_models:
+            started, _ = start_live_services()
             threading.Thread(target=poll_telegram_commands, daemon=True).start()
-            print("Live mode activated.")
-            send_telegram_with_keyboard(
-                "BOT READY!\n\n"
-                f"{len(trained_models)} models trained\nExpiry: 30 min\n"
-                f"Threshold: {THRESHOLD}%\n\n"
-                "Signals will be sent automatically.\n"
-                "Result of each signal reported 31 min later.\n\n"
-                "از دکمه های پایین استفاده کن یا /help بزن"
-            )
+            if started:
+                print("Live mode activated.")
+                send_telegram_with_keyboard(
+                    "BOT READY! (LGBM + MLP + LR)\n\n"
+                    f"{len(trained_models)} models trained\nExpiry: 30 min\n"
+                    f"Threshold: {THRESHOLD}%\n\n"
+                    "Signals will be sent automatically.\n"
+                    "Result of each signal reported 33 min later.\n\n"
+                    "از دکمه های پایین استفاده کن یا /help بزن"
+                )
         auto_start_done = True
     except Exception as e:
         print(f"auto_start error: {e}")
@@ -1214,7 +1377,6 @@ def auto_start():
 
 @app.route('/health')
 def health_route():
-    """JSON health check برای UptimeRobot"""
     return jsonify({
         "status": "running",
         "models": len(trained_models),
@@ -1225,8 +1387,6 @@ def health_route():
 
 @app.route('/')
 def dashboard():
-    """داشبورد HTML با همه لینک‌ها"""
-    
     models_count = len(trained_models)
     live_status = "🟢 فعال" if live_running else "🔴 غیرفعال"
     backtest_status = "⏳ در حال اجرا" if backtest_running else "✅ متوقف"
@@ -1329,7 +1489,7 @@ def dashboard():
     <body>
         <div class="container">
             <h1>🤖 Pocket Option Signal Bot</h1>
-            <p class="subtitle">داشبورد مدیریت ربات سیگنال‌دهنده</p>
+            <p class="subtitle">داشبورد مدیریت ربات سیگنال‌دهنده (Diverse 3-Model Consensus)</p>
 
             <div class="status-grid">
                 <div class="status-card">
@@ -1397,14 +1557,14 @@ def dashboard():
 
                 <a href="/backtest" class="link-card">
                     <div class="title">🔄 اجرای Backtest</div>
-                    <div class="desc">شروع بک‌تست جدید (۵-۴۰ دقیقه)</div>
+                    <div class="desc">شروع بک‌تست جدید (۸-۱۲ دقیقه)</div>
                     <span class="path">/backtest</span>
                 </a>
             </div>
 
             <div class="footer">
                 <p>Pocket Option Signal Bot &copy; 2026</p>
-                <p>Random Forest ML + TwelveData</p>
+                <p>LightGBM + MLP Neural Net + LogisticRegression(C=2.0) + TwelveData</p>
             </div>
         </div>
     </body>
@@ -1421,25 +1581,18 @@ def backtest_route():
 
 @app.route('/start_live', methods=['GET'])
 def start_live_route():
-    global live_running
-    if live_running:
-        return jsonify({"status": "already_running"}), 200
-    if not trained_models:
-        return jsonify({"status": "error", "message": "No models trained yet"}), 400
-    live_running = True
-    threading.Thread(target=live_loop, daemon=True).start()
-    threading.Thread(target=result_checker_loop, daemon=True).start()
-    threading.Thread(target=daily_summary_loop, daemon=True).start()
-    send_telegram("Live mode activated.")
-    return jsonify({"status": "started"}), 200
+    ok, msg = start_live_services()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 400
+    send_telegram(msg)
+    return jsonify({"status": "ok", "message": msg}), 200
 
 
 @app.route('/stop_live', methods=['GET'])
 def stop_live_route():
-    global live_running
-    live_running = False
-    send_telegram("Live mode stopped.")
-    return jsonify({"status": "stopped"}), 200
+    _, msg = stop_live_services()
+    send_telegram(msg)
+    return jsonify({"status": "stopped", "message": msg}), 200
 
 
 @app.route('/status', methods=['GET'])
@@ -1479,21 +1632,25 @@ def analysis_route():
 
 @app.route('/stats', methods=['GET'])
 def stats_route():
-    total = len(completed_signals)
-    wins = sum(1 for s in completed_signals if s.get('is_win') is True)
-    losses = sum(1 for s in completed_signals if s.get('is_win') is False)
-    ties = sum(1 for s in completed_signals if s.get('is_win') is None)
+    with signal_lock:
+        comp_copy = list(completed_signals)
+        pend_len = len(pending_signals)
+
+    total = len(comp_copy)
+    wins = sum(1 for s in comp_copy if s.get('is_win') is True)
+    losses = sum(1 for s in comp_copy if s.get('is_win') is False)
+    ties = sum(1 for s in comp_copy if s.get('is_win') is None)
     decided = wins + losses
     wr = round(wins / decided * 100, 2) if decided > 0 else 0
     recent_data = []
-    for s in completed_signals[-10:]:
+    for s in comp_copy[-10:]:
         recent_data.append({
             "symbol": s['symbol'], "direction": s['direction'],
             "result": s['result'], "time": fmt_iran(s['entry_time']),
         })
     return jsonify({
         "total": total, "wins": wins, "losses": losses, "ties": ties,
-        "pending": len(pending_signals), "win_rate": wr, "recent": recent_data,
+        "pending": pend_len, "win_rate": wr, "recent": recent_data,
     }), 200
 
 
