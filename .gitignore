@@ -1,8 +1,0 @@
-# .gitignore
-.env
-signals_data.json
-signals_data.json.tmp
-__pycache__/
-*.pyc
-.venv/
-venv/
